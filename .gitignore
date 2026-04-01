@@ -1,0 +1,37 @@
+# Build outputs
+dist/
+publish/
+backend/static/
+backend/build/
+backend/__pycache__/
+backend/*.spec
+
+# Python
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+__pycache__/
+
+# Config (contains API keys)
+backend/config.json
+config.json
+
+# Node
+frontend/node_modules/
+frontend/dist/
+node_modules/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
