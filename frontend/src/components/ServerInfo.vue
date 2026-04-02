@@ -36,8 +36,14 @@ const linuxWriteCommand = computed(() => {
 })
 
 const windowsWriteCommand = computed(() => {
-  const escaped = settingsJson.value.replace(/"/g, '\\"')
-  return `if not exist "%USERPROFILE%\\.claude" mkdir "%USERPROFILE%\\.claude"\necho ${escaped} > "%USERPROFILE%\\.claude\\settings.json"`
+  const lines = settingsJson.value.split('\n')
+  let cmd = 'if not exist "%USERPROFILE%\\.claude" mkdir "%USERPROFILE%\\.claude"\n'
+  cmd += '(\n'
+  for (const line of lines) {
+    cmd += `echo ${line.replace(/>/g, '^>').replace(/</g, '^<').replace(/&/g, '^&').replace(/\|/g, '^|')}\n`
+  }
+  cmd += ') > "%USERPROFILE%\\.claude\\settings.json"'
+  return cmd
 })
 
 async function save() {
@@ -226,7 +232,7 @@ onMounted(async () => {
             <span class="path-label">配置文件路径：</span>
             <code>%USERPROFILE%\.claude\settings.json</code>
           </div>
-          <h4 class="sub-title">PowerShell 一键写入命令</h4>
+          <h4 class="sub-title">CMD 一键写入命令</h4>
           <div class="code-block-wrapper">
             <pre class="code-block">{{ windowsWriteCommand }}</pre>
             <el-button
