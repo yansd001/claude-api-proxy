@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import sys
 import uuid
@@ -11,6 +12,9 @@ from typing import Any
 
 def _get_config_path() -> Path:
     """Return a writable config.json path regardless of frozen/dev mode."""
+    env_path = os.environ.get("CONFIG_PATH")
+    if env_path:
+        return Path(env_path)
     if getattr(sys, "frozen", False):
         # Running as PyInstaller bundle: store config next to the .exe
         return Path(sys.executable).parent / "config.json"
