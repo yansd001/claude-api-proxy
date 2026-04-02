@@ -28,6 +28,7 @@ node_modules/
 
 # Editor
 .vscode/
+.claude/
 .idea/
 *.swp
 *.swo
