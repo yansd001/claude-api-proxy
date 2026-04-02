@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import sys
 import uuid
@@ -398,6 +399,13 @@ def configure_claude_external(body: dict):
         "API_TIMEOUT_MS": "300000",
     })
     return {"success": True}
+
+
+# --- Runtime info ---
+
+@app.get("/api/runtime-info")
+def runtime_info():
+    return {"docker": bool(os.environ.get("CONFIG_PATH"))}
 
 
 # --- Server settings ---

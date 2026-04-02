@@ -26,6 +26,9 @@ export const api = {
   getServer: () => http.get<ServerConfig>('/server').then(r => r.data),
   updateServer: (s: ServerConfig) => http.put('/server', s),
 
+  // Runtime info
+  getRuntimeInfo: () => http.get<{ docker: boolean }>('/runtime-info').then(r => r.data),
+
   // Claude Code management
   claudeCodeStatus: () => http.get<{ installed: boolean }>('/claude-code/status').then(r => r.data),
   installClaudeCode: () => http.post('/claude-code/install'),
