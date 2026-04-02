@@ -1,16 +1,22 @@
-FROM debian:bookworm-slim
+# ---- Stage 1: Build Vue frontend ----
+FROM node:20-slim AS frontend-builder
+WORKDIR /build
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ .
+RUN npm run build
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+# ---- Stage 2: Python runtime ----
+FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY publish-linux/claude-api-proxy /app/claude-api-proxy
-COPY publish-linux/static /app/static
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-RUN chmod +x /app/claude-api-proxy
+COPY backend/ .
+COPY --from=frontend-builder /build/dist ./static
 
 EXPOSE 8000
 
-ENTRYPOINT ["/app/claude-api-proxy"]
+CMD ["python", "run.py"]
