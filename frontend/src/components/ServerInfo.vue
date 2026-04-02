@@ -13,6 +13,9 @@ const newKeyVisible = ref(false)
 const isDocker = ref(false)
 
 const proxyBaseUrl = computed(() => {
+  if (isDocker.value) {
+    return `${window.location.protocol}//${window.location.host}`
+  }
   const host = form.value.host === '0.0.0.0' ? 'localhost' : form.value.host
   return `http://${host}:${form.value.port}`
 })
