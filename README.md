@@ -124,3 +124,25 @@ OpenAI 兼容的第三方 API 只需修改 Base URL 即可，例如：
 - DeepSeek: `https://api.deepseek.com/v1`
 - 硅基流动: `https://api.siliconflow.cn/v1`
 - 火山引擎: `https://ark.cn-beijing.volces.com/api/v3`
+
+---
+
+## Docker 一键部署
+
+> 需要先登录 GitHub Container Registry（私有仓库需认证）
+
+```bash
+# 登录 GHCR（使用 GitHub Personal Access Token，需要 read:packages 权限）
+echo $CR_PAT | docker login ghcr.io -u USERNAME --password-stdin
+
+# 一键启动
+docker run -d \
+  --name claude-api-proxy \
+  -p 8000:8000 \
+  -v $(pwd)/config.json:/app/config.json \
+  --restart unless-stopped \
+  ghcr.io/yansd001/claude-api-proxy:latest
+```
+
+- 启动后访问 `http://<服务器IP>:8000/ui/` 打开配置界面
+- `config.json` 通过卷挂载持久化到宿主机当前目录，容器重建后配置不丢失
