@@ -29,6 +29,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "host": "0.0.0.0",
         "api_key": secrets.token_urlsafe(32),
     },
+    "anthropic_direct": {
+        "enabled": False,
+        "base_url": "https://yansd666.com",
+        "api_key": "",
+    },
     "providers": [],
     "model_mappings": [],
     "default_provider_id": "",

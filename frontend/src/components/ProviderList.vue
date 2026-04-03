@@ -11,8 +11,9 @@ const emit = defineEmits<{ updated: [] }>()
 const dialogVisible = ref(false)
 const isEdit = ref(false)
 const editingId = ref('')
-const modelsInput = ref('')   // comma-separated models text
 const apiKeyVisible = ref(false)
+const fetchingModels = ref(false)
+const remoteModels = ref<string[]>([])   // models fetched from remote API
 
 const emptyForm = (): Omit<Provider, 'id'> => ({
   type: 'openai',
@@ -40,7 +41,7 @@ function openAdd() {
   isEdit.value = false
   form.value = emptyForm()
   form.value.base_url = defaultBaseUrls['openai']
-  modelsInput.value = ''
+  remoteModels.value = []
   apiKeyVisible.value = false
   dialogVisible.value = true
 }
@@ -48,18 +49,30 @@ function openAdd() {
 function openEdit(p: Provider) {
   isEdit.value = true
   editingId.value = p.id
-  form.value = { ...p }
-  modelsInput.value = p.models.join(', ')
+  form.value = { ...p, models: [...p.models] }
+  remoteModels.value = [...p.models]
   apiKeyVisible.value = false
   dialogVisible.value = true
 }
 
-async function submitForm() {
-  form.value.models = modelsInput.value
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean)
+async function fetchRemoteModels() {
+  if (!form.value.base_url || !form.value.api_key) {
+    ElMessage.warning('请先填写 Base URL 和 API Key')
+    return
+  }
+  fetchingModels.value = true
+  try {
+    const result = await api.fetchModels(form.value.base_url, form.value.api_key)
+    remoteModels.value = result.models
+    ElMessage.success(`获取到 ${result.models.length} 个模型`)
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || '获取模型列表失败，请检查 Base URL 和 API Key')
+  } finally {
+    fetchingModels.value = false
+  }
+}
 
+async function submitForm() {
   if (!form.value.name || !form.value.base_url || !form.value.api_key) {
     ElMessage.warning('请填写所有必填字段')
     return
@@ -190,12 +203,30 @@ function typeTag(type: ProviderType) {
           </el-input>
         </el-form-item>
         <el-form-item label="可用模型">
-          <el-input
-            v-model="modelsInput"
-            type="textarea"
-            :rows="3"
-            placeholder="gpt-4o, gpt-4o-mini（逗号分隔，用于模型映射下拉选择）"
-          />
+          <div style="display:flex;gap:8px;width:100%">
+            <el-select
+              v-model="form.models"
+              filterable
+              allow-create
+              multiple
+              default-first-option
+              placeholder="选择或输入模型名后回车添加"
+              style="flex:1"
+            >
+              <el-option
+                v-for="m in remoteModels"
+                :key="m"
+                :label="m"
+                :value="m"
+              />
+            </el-select>
+            <el-button
+              :loading="fetchingModels"
+              @click="fetchRemoteModels"
+              :disabled="!form.base_url || !form.api_key"
+            >获取模型</el-button>
+          </div>
+          <div class="hint">可手动输入模型名回车添加，也可点击"获取模型"从远端拉取可用列表</div>
         </el-form-item>
         <el-form-item label="启用">
           <el-switch v-model="form.enabled" />

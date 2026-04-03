@@ -2,14 +2,22 @@
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '../api'
-import type { AppConfig, ServerConfig } from '../types'
+import type { AnthropicDirect, AppConfig, ServerConfig } from '../types'
 
 const props = defineProps<{ config: AppConfig }>()
 const emit = defineEmits<{ updated: [] }>()
 
 const form = ref<ServerConfig>({ ...props.config.server })
+const directForm = ref<AnthropicDirect>({
+  enabled: false,
+  base_url: 'https://yansd666.com',
+  api_key: '',
+  ...props.config.anthropic_direct,
+})
 const saving = ref(false)
+const savingDirect = ref(false)
 const newKeyVisible = ref(false)
+const directKeyVisible = ref(false)
 const isDocker = ref(false)
 
 const proxyBaseUrl = computed(() => {
@@ -57,6 +65,24 @@ async function save() {
   } finally {
     saving.value = false
   }
+}
+
+async function saveDirect() {
+  savingDirect.value = true
+  try {
+    await api.updateAnthropicDirect(directForm.value)
+    ElMessage.success('Anthropic 直连配置已保存')
+    emit('updated')
+  } catch {
+    ElMessage.error('保存失败')
+  } finally {
+    savingDirect.value = false
+  }
+}
+
+async function toggleDirect(enabled: boolean) {
+  directForm.value.enabled = enabled
+  await saveDirect()
 }
 
 function regenerateKey() {
@@ -189,6 +215,61 @@ onMounted(async () => {
         <code>ANTHROPIC_BASE_URL={{ proxyBaseUrl }} ANTHROPIC_API_KEY={{ form.api_key }} claude</code>
       </template>
     </el-alert>
+
+    <el-divider />
+    <h3 class="section-title">转发模式</h3>
+
+    <div class="mode-switch-row">
+      <span class="mode-label">Anthropic 直连</span>
+      <el-switch
+        :model-value="directForm.enabled"
+        @change="toggleDirect"
+        active-text="直连"
+        inactive-text="代理"
+      />
+      <el-tag v-if="directForm.enabled" type="success" size="small" style="margin-left:8px">
+        请求将直接转发到 Anthropic API
+      </el-tag>
+      <el-tag v-else type="info" size="small" style="margin-left:8px">
+        请求将通过提供商转换后转发
+      </el-tag>
+    </div>
+
+    <template v-if="directForm.enabled">
+      <el-alert type="warning" :closable="false" style="margin:12px 0">
+        直连模式下，请求将原样转发到 Anthropic API（兼容 AWS Bedrock），不经过 OpenAI/Gemini 格式转换。
+        提供商和模型映射配置将被忽略。
+      </el-alert>
+
+      <el-form :model="directForm" label-width="120px" style="max-width:560px;margin-top:12px">
+        <el-form-item label="Base URL">
+          <el-input v-model="directForm.base_url" placeholder="https://yansd666.com" />
+          <div class="hint">
+            默认: https://yansd666.com<br />
+            AWS Bedrock: https://bedrock-runtime.{region}.amazonaws.com
+          </div>
+        </el-form-item>
+        <el-form-item label="API Key">
+          <div style="display:flex;align-items:center;gap:8px;width:100%">
+            <el-input
+              v-model="directForm.api_key"
+              :type="directKeyVisible ? 'text' : 'password'"
+              placeholder="Anthropic API Key"
+              style="flex:1"
+            />
+            <el-button size="small" text @click="directKeyVisible = !directKeyVisible">
+              {{ directKeyVisible ? '隐藏' : '显示' }}
+            </el-button>
+          </div>
+          <div class="hint">上游 Anthropic API 的密钥（与代理 API Key 不同）</div>
+        </el-form-item>
+        <el-form-item>
+          <el-button type="primary" :loading="savingDirect" @click="saveDirect">
+            保存直连配置
+          </el-button>
+        </el-form-item>
+      </el-form>
+    </template>
 
     <el-divider />
     <h3 class="section-title">Claude Code 快捷操作</h3>
@@ -359,6 +440,8 @@ onMounted(async () => {
 .action-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
 .install-section { margin-top: 16px; }
 .install-row { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+.mode-switch-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.mode-label { font-size: 14px; font-weight: 500; }
 .path-info { margin: 8px 0; font-size: 13px; }
 .path-label { color: #666; }
 .path-info code { background: #f5f5f5; padding: 2px 6px; border-radius: 3px; font-size: 13px; }

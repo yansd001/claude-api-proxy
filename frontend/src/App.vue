@@ -27,7 +27,7 @@ onMounted(loadConfig)
   <div class="app-wrapper">
     <header class="app-header">
       <h1 class="title">Claude API 代理配置</h1>
-      <span class="subtitle">将 Claude Code 请求转发到 OpenAI / Gemini</span>
+      <span class="subtitle">将 Claude Code 请求转发到 OpenAI / Gemini / Anthropic</span>
     </header>
 
     <el-container v-if="!loading && config" class="main-content">

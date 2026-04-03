@@ -112,6 +112,76 @@ async def _aiter_lines(response: httpx.Response) -> AsyncGenerator[str, None]:
 
 
 # ---------------------------------------------------------------------------
+# Anthropic direct forwarding – pass-through headers for AWS Bedrock compat
+# ---------------------------------------------------------------------------
+
+# Headers from the incoming request that should be forwarded to the upstream
+# Anthropic-compatible API (including AWS Bedrock / proxy variants).
+_ANTHROPIC_FORWARD_HEADERS = {
+    "anthropic-version",
+    "anthropic-beta",
+    "x-api-key",
+    "content-type",
+}
+
+
+def _build_anthropic_direct_headers(
+    request: Request, direct_cfg: dict
+) -> dict[str, str]:
+    """Build headers for the upstream Anthropic API call.
+
+    Forwards recognised Anthropic headers from the incoming request and
+    overwrites the auth key with the configured direct API key.
+    """
+    headers: dict[str, str] = {}
+    for name in _ANTHROPIC_FORWARD_HEADERS:
+        value = request.headers.get(name)
+        if value:
+            headers[name] = value
+
+    # Always set auth from config – never leak proxy key to upstream
+    api_key = direct_cfg.get("api_key", "")
+    if api_key:
+        headers["x-api-key"] = api_key
+        headers.pop("Authorization", None)  # prefer x-api-key for Anthropic
+
+    # Ensure content-type
+    headers.setdefault("content-type", "application/json")
+    return headers
+
+
+async def _forward_anthropic_direct(
+    request: Request, body: dict, direct_cfg: dict
+) -> StreamingResponse | dict:
+    """Forward the request as-is to the upstream Anthropic API."""
+    base_url: str = direct_cfg.get("base_url", "https://yansd666.com").rstrip("/")
+    url = f"{base_url}/v1/messages"
+    headers = _build_anthropic_direct_headers(request, direct_cfg)
+    is_stream = body.get("stream", False)
+
+    if is_stream:
+        async def generate() -> AsyncGenerator[bytes, None]:
+            async with httpx.AsyncClient(timeout=600) as client:
+                async with client.stream(
+                    "POST", url, json=body, headers=headers
+                ) as resp:
+                    if resp.status_code >= 400:
+                        err_body = await resp.aread()
+                        yield err_body
+                        return
+                    async for chunk in resp.aiter_bytes():
+                        yield chunk
+
+        return StreamingResponse(generate(), media_type="text/event-stream")
+
+    async with httpx.AsyncClient(timeout=600) as client:
+        resp = await client.post(url, json=body, headers=headers)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.json())
+    return resp.json()
+
+
+# ---------------------------------------------------------------------------
 # /v1/messages  – main Claude-compatible endpoint
 # ---------------------------------------------------------------------------
 
@@ -119,6 +189,11 @@ async def _aiter_lines(response: httpx.Response) -> AsyncGenerator[str, None]:
 async def messages(request: Request):
     config = load_config()
     body: dict = await request.json()
+
+    # ---- Anthropic direct forwarding (bypass provider conversion) ----
+    direct_cfg = config.get("anthropic_direct", {})
+    if direct_cfg.get("enabled"):
+        return await _forward_anthropic_direct(request, body, direct_cfg)
 
     claude_model: str = body.get("model", "")
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
@@ -421,6 +496,59 @@ def update_server(body: dict):
     config["server"] = body
     save_config(config)
     return body
+
+
+# --- Anthropic Direct settings ---
+
+@app.get("/api/anthropic-direct")
+def get_anthropic_direct():
+    return load_config().get("anthropic_direct", {
+        "enabled": False,
+        "base_url": "https://yansd666.com",
+        "api_key": "",
+    })
+
+
+@app.put("/api/anthropic-direct")
+def update_anthropic_direct(body: dict):
+    config = load_config()
+    config["anthropic_direct"] = body
+    save_config(config)
+    return body
+
+
+# --- Fetch remote models for a provider ---
+
+@app.post("/api/fetch-models")
+async def fetch_models(body: dict):
+    """Proxy request to fetch available models from a provider's /v1/models endpoint."""
+    base_url: str = body.get("base_url", "").rstrip("/")
+    api_key: str = body.get("api_key", "")
+    if not base_url or not api_key:
+        raise HTTPException(status_code=400, detail="base_url and api_key are required")
+    if not base_url.endswith("/v1"):
+        url = f"{base_url}/v1/models"
+    else:
+        url = f"{base_url}/models"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url, headers=headers)
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        data = resp.json()
+        # Extract model ids from OpenAI-compatible response
+        models = [m["id"] for m in data.get("data", []) if "id" in m]
+        return {"models": models}
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="请求超时，请检查 Base URL 是否正确")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------------------------------------------------------

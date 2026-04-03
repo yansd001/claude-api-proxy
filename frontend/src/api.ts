@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { AppConfig, ModelMapping, Provider, ServerConfig } from './types'
+import type { AnthropicDirect, AppConfig, ModelMapping, Provider, ServerConfig } from './types'
 
 const http = axios.create({ baseURL: '/api' })
 
@@ -25,6 +25,14 @@ export const api = {
   // Server settings
   getServer: () => http.get<ServerConfig>('/server').then(r => r.data),
   updateServer: (s: ServerConfig) => http.put('/server', s),
+
+  // Anthropic direct settings
+  getAnthropicDirect: () => http.get<AnthropicDirect>('/anthropic-direct').then(r => r.data),
+  updateAnthropicDirect: (d: AnthropicDirect) => http.put('/anthropic-direct', d),
+
+  // Fetch remote models from provider
+  fetchModels: (base_url: string, api_key: string) =>
+    http.post<{ models: string[] }>('/fetch-models', { base_url, api_key }).then(r => r.data),
 
   // Runtime info
   getRuntimeInfo: () => http.get<{ docker: boolean }>('/runtime-info').then(r => r.data),

@@ -22,8 +22,15 @@ export interface ServerConfig {
   api_key: string
 }
 
+export interface AnthropicDirect {
+  enabled: boolean
+  base_url: string
+  api_key: string
+}
+
 export interface AppConfig {
   server: ServerConfig
+  anthropic_direct: AnthropicDirect
   providers: Provider[]
   model_mappings: ModelMapping[]
   default_provider_id: string
