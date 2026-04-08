@@ -20,6 +20,29 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from auth import verify_api_key
+
+# ---------------------------------------------------------------------------
+# Shared httpx client – reuse connections across concurrent requests
+# ---------------------------------------------------------------------------
+_http_client: httpx.AsyncClient | None = None
+
+_MAX_RETRIES = 3
+_RETRY_DELAY = 0.5  # seconds, doubled each retry
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(600, connect=30),
+            limits=httpx.Limits(
+                max_connections=200,
+                max_keepalive_connections=40,
+                keepalive_expiry=120,
+            ),
+            http2=True,
+        )
+    return _http_client
 from config_manager import load_config, new_provider_id, save_config
 from converters.gemini_conv import (
     build_gemini_request,
@@ -40,6 +63,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("shutdown")
+async def _shutdown_http_client():
+    global _http_client
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
+
+
+async def _post_with_retry(
+    url: str, *, json: dict, headers: dict
+) -> httpx.Response:
+    """POST with automatic retry on transient connection errors."""
+    client = _get_http_client()
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            return await client.post(url, json=json, headers=headers)
+        except (httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError) as exc:
+            last_exc = exc
+            if attempt < _MAX_RETRIES - 1:
+                await asyncio.sleep(_RETRY_DELAY * (2 ** attempt))
+    raise last_exc  # type: ignore[misc]
 
 
 def _static_dir() -> Path | None:
@@ -161,21 +208,20 @@ async def _forward_anthropic_direct(
 
     if is_stream:
         async def generate() -> AsyncGenerator[bytes, None]:
-            async with httpx.AsyncClient(timeout=600) as client:
-                async with client.stream(
-                    "POST", url, json=body, headers=headers
-                ) as resp:
-                    if resp.status_code >= 400:
-                        err_body = await resp.aread()
-                        yield err_body
-                        return
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
+            client = _get_http_client()
+            async with client.stream(
+                "POST", url, json=body, headers=headers
+            ) as resp:
+                if resp.status_code >= 400:
+                    err_body = await resp.aread()
+                    yield err_body
+                    return
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
-    async with httpx.AsyncClient(timeout=600) as client:
-        resp = await client.post(url, json=body, headers=headers)
+    resp = await _post_with_retry(url, json=body, headers=headers)
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.json())
     return resp.json()
@@ -213,21 +259,20 @@ async def messages(request: Request):
 
         if is_stream:
             async def generate() -> AsyncGenerator[bytes, None]:
-                async with httpx.AsyncClient(timeout=600) as client:
-                    async with client.stream("POST", url, json=openai_req, headers=headers) as resp:
-                        if resp.status_code >= 400:
-                            err_body = await resp.aread()
-                            yield f"data: {err_body.decode()}\n\n".encode()
-                            return
-                        async for chunk in stream_openai_to_anthropic(
-                            _aiter_lines(resp), claude_model, message_id
-                        ):
-                            yield chunk.encode()
+                client = _get_http_client()
+                async with client.stream("POST", url, json=openai_req, headers=headers) as resp:
+                    if resp.status_code >= 400:
+                        err_body = await resp.aread()
+                        yield f"data: {err_body.decode()}\n\n".encode()
+                        return
+                    async for chunk in stream_openai_to_anthropic(
+                        _aiter_lines(resp), claude_model, message_id
+                    ):
+                        yield chunk.encode()
 
             return StreamingResponse(generate(), media_type="text/event-stream")
 
-        async with httpx.AsyncClient(timeout=600) as client:
-            resp = await client.post(url, json=openai_req, headers=headers)
+        resp = await _post_with_retry(url, json=openai_req, headers=headers)
         if resp.status_code >= 400:
             raise HTTPException(status_code=resp.status_code, detail=resp.json())
         return convert_openai_response(resp.json(), claude_model, message_id)
@@ -246,16 +291,16 @@ async def messages(request: Request):
             )
 
             async def generate_gemini() -> AsyncGenerator[bytes, None]:
-                async with httpx.AsyncClient(timeout=600) as client:
-                    async with client.stream("POST", url, json=gemini_body, headers=headers) as resp:
-                        if resp.status_code >= 400:
-                            err_body = await resp.aread()
-                            yield f"data: {err_body.decode()}\n\n".encode()
-                            return
-                        async for chunk in stream_gemini_to_anthropic(
-                            _aiter_lines(resp), claude_model, message_id
-                        ):
-                            yield chunk.encode()
+                client = _get_http_client()
+                async with client.stream("POST", url, json=gemini_body, headers=headers) as resp:
+                    if resp.status_code >= 400:
+                        err_body = await resp.aread()
+                        yield f"data: {err_body.decode()}\n\n".encode()
+                        return
+                    async for chunk in stream_gemini_to_anthropic(
+                        _aiter_lines(resp), claude_model, message_id
+                    ):
+                        yield chunk.encode()
 
             return StreamingResponse(generate_gemini(), media_type="text/event-stream")
 
@@ -263,8 +308,7 @@ async def messages(request: Request):
             f"{base_url}/v1beta/models/{gemini_model}"
             f":generateContent?key={api_key}"
         )
-        async with httpx.AsyncClient(timeout=600) as client:
-            resp = await client.post(url, json=gemini_body, headers=headers)
+        resp = await _post_with_retry(url, json=gemini_body, headers=headers)
         if resp.status_code >= 400:
             raise HTTPException(status_code=resp.status_code, detail=resp.json())
         return convert_gemini_response(resp.json(), claude_model, message_id)
