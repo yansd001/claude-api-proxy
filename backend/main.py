@@ -10,6 +10,7 @@ import os
 import shutil
 import sys
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
@@ -55,7 +56,16 @@ from converters.openai_conv import (
     stream_openai_to_anthropic,
 )
 
-app = FastAPI(title="Claude API Proxy", version="1.0.0")
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    yield
+    global _http_client
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
+
+
+app = FastAPI(title="Claude API Proxy", version="1.0.0", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,14 +73,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("shutdown")
-async def _shutdown_http_client():
-    global _http_client
-    if _http_client is not None:
-        await _http_client.aclose()
-        _http_client = None
 
 
 async def _post_with_retry(
