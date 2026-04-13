@@ -16,9 +16,9 @@ COPY backend-rust/src ./src
 RUN cargo build --release
 
 # ---- Stage 3: Runtime ----
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3t64 && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
