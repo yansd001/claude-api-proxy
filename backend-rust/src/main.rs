@@ -756,7 +756,8 @@ async fn main() {
 
     let mut app = Router::new()
         .merge(messages_route)
-        .merge(config_api);
+        .merge(config_api)
+        .route("/", get(|| async { Redirect::permanent("/ui/") }));
 
     // Serve static files if directory exists
     if let Some(ui_dir) = static_dir() {
