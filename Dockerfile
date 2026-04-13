@@ -11,7 +11,7 @@ FROM rust:1.94-slim AS backend-builder
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY backend-rust/Cargo.toml backend-rust/Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src target/release/claude-api-proxy target/release/deps/claude_api_proxy-*
 COPY backend-rust/src ./src
 RUN cargo build --release
 
