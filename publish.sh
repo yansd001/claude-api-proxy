@@ -3,11 +3,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 FRONTEND="$ROOT/frontend"
-BACKEND="$ROOT/backend"
+BACKEND_RUST="$ROOT/backend-rust"
 PUBLISH="$ROOT/publish-linux"
 
 echo "============================================================"
-echo "  Claude API Proxy - Linux Build and Publish"
+echo "  Claude API Proxy (Rust) - Linux Build and Publish"
 echo "============================================================"
 echo
 
@@ -21,18 +21,13 @@ if ! command -v npm &>/dev/null; then
     exit 1
 fi
 
-PYTHON_CMD=""
-if command -v python3 &>/dev/null; then
-    PYTHON_CMD=python3
-elif command -v python &>/dev/null; then
-    PYTHON_CMD=python
-else
-    echo "[Error] Python not found. Please install Python 3.11+"
+if ! command -v cargo &>/dev/null; then
+    echo "[Error] cargo not found. Please install Rust (https://rustup.rs)."
     exit 1
 fi
 
 echo "      npm:    OK"
-echo "      python: OK ($PYTHON_CMD)"
+echo "      cargo:  OK"
 echo
 
 # ----------------------------------------------------------------
@@ -46,51 +41,33 @@ npm run build
 echo
 
 # ----------------------------------------------------------------
-# Step 2: Copy frontend dist to backend/static
+# Step 2: Prepare output directory
 # ----------------------------------------------------------------
-echo "[2/4] Copying frontend dist to backend/static..."
+echo "[2/4] Preparing output directory..."
 cd "$ROOT"
 
-rm -rf "$BACKEND/static"
-cp -r "$FRONTEND/dist" "$BACKEND/static"
-echo "      frontend/dist -> backend/static"
-echo
-
-# ----------------------------------------------------------------
-# Step 3: Install Python deps and package with PyInstaller
-# ----------------------------------------------------------------
-echo "[3/4] Installing Python dependencies and packaging binary..."
-cd "$BACKEND"
-
-$PYTHON_CMD -m pip install -r requirements.txt -r build-requirements.txt -q
-
-# Clean publish dir before packaging
 rm -rf "$PUBLISH"
 mkdir -p "$PUBLISH"
-
-$PYTHON_CMD -m PyInstaller \
-    --onefile \
-    --name claude-api-proxy \
-    --add-data "static:static" \
-    --collect-all uvicorn \
-    --collect-all fastapi \
-    --collect-all starlette \
-    --collect-all httpx \
-    --hidden-import anyio._backends._asyncio \
-    --hidden-import anyio._backends._trio \
-    --distpath "$PUBLISH" \
-    --clean \
-    main.py
-
+cp -r "$FRONTEND/dist" "$PUBLISH/static"
+echo "      frontend/dist -> publish-linux/static"
 echo
 
 # ----------------------------------------------------------------
-# Step 4: Copy frontend static files to publish-linux/static
+# Step 3: Build Rust backend
 # ----------------------------------------------------------------
-echo "[4/4] Copying frontend static files to publish-linux/static..."
+echo "[3/4] Building Rust backend (release)..."
+cd "$BACKEND_RUST"
+
+cargo build --release
+echo
+
+# ----------------------------------------------------------------
+# Step 4: Copy binary to publish
+# ----------------------------------------------------------------
+echo "[4/4] Copying binary to publish-linux..."
 cd "$ROOT"
 
-cp -r "$BACKEND/static" "$PUBLISH/static"
+cp "$BACKEND_RUST/target/release/claude-api-proxy" "$PUBLISH/claude-api-proxy"
 
 echo
 echo "============================================================"
@@ -98,6 +75,8 @@ echo "  Build complete!"
 echo "  Output:  $PUBLISH"
 echo "  Binary:  $PUBLISH/claude-api-proxy"
 echo "  UI:      $PUBLISH/static/  (can be updated independently)"
+echo "  config.json will be created next to the binary on first launch."
+echo "============================================================"
 echo "  config.json will be created next to the binary on first launch."
 echo "============================================================"
 echo

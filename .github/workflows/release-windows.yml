@@ -1,0 +1,92 @@
+name: Build and Release Windows Exe
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（留空则自动递增，如 0.0.1 → 0.0.2）"
+        required: false
+        default: ""
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          INPUT_VERSION="${{ github.event.inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            # 去掉前缀 v（如果有）
+            VERSION="${INPUT_VERSION#v}"
+          else
+            # 获取最新 release tag
+            LATEST=$(gh release view --json tagName -q .tagName 2>/dev/null || echo "")
+            if [ -z "$LATEST" ]; then
+              VERSION="0.0.1"
+            else
+              # 去掉 v 前缀后递增最后一段
+              LATEST="${LATEST#v}"
+              IFS='.' read -r MAJOR MINOR PATCH <<< "$LATEST"
+              PATCH=$((PATCH + 1))
+              VERSION="${MAJOR}.${MINOR}.${PATCH}"
+            fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "📦 Version: v$VERSION"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm install
+          npm run build
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            backend-rust/target
+          key: windows-cargo-${{ hashFiles('backend-rust/Cargo.lock') }}
+          restore-keys: windows-cargo-
+
+      - name: Build Rust backend
+        working-directory: backend-rust
+        run: cargo build --release
+
+      - name: Package artifacts
+        shell: bash
+        run: |
+          mkdir -p release-artifacts
+          cp backend-rust/target/release/claude-api-proxy.exe release-artifacts/
+          cp -r frontend/dist release-artifacts/static
+          cd release-artifacts
+          7z a ../claude-api-proxy-windows-amd64.zip ./*
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          files: claude-api-proxy-windows-amd64.zip
+          generate_release_notes: true

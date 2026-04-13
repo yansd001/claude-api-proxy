@@ -6,15 +6,23 @@ RUN npm ci
 COPY frontend/ .
 RUN npm run build
 
-# ---- Stage 2: Python runtime ----
-FROM python:3.11-slim
+# ---- Stage 2: Build Rust backend ----
+FROM rust:1.94-slim AS backend-builder
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY backend-rust/Cargo.toml backend-rust/Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
+COPY backend-rust/src ./src
+RUN cargo build --release
+
+# ---- Stage 3: Runtime ----
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY backend/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY backend/ .
+COPY --from=backend-builder /build/target/release/claude-api-proxy .
 COPY --from=frontend-builder /build/dist ./static
 
 RUN mkdir -p /app/data
@@ -23,4 +31,4 @@ VOLUME /app/data
 
 EXPOSE 8000
 
-CMD ["python", "run.py"]
+CMD ["./claude-api-proxy"]

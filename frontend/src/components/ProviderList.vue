@@ -118,13 +118,89 @@ async function toggleEnabled(p: Provider) {
 function typeTag(type: ProviderType) {
   return type === 'gemini' ? 'success' : 'primary'
 }
+
+// ---- Quick-add preset ----
+type PresetType = 'openai' | 'gemini'
+
+const quickDialogVisible = ref(false)
+const quickPreset = ref<PresetType>('openai')
+const quickForm = ref({ name: '', base_url: '', api_key: '' })
+const quickSubmitting = ref(false)
+
+const presetConfig: Record<PresetType, {
+  label: string
+  defaultUrl: string
+  models: string[]
+  mappings: { claude_model: string; target_model: string }[]
+}> = {
+  openai: {
+    label: 'GPT',
+    defaultUrl: 'https://yansd666.com',
+    models: ['gpt-5.4', 'gpt-5.4-mini'],
+    mappings: [
+      { claude_model: 'claude-sonnet-4-6', target_model: 'gpt-5.4' },
+      { claude_model: 'claude-haiku-4-5-20251000', target_model: 'gpt-5.4-mini' },
+    ],
+  },
+  gemini: {
+    label: 'Gemini',
+    defaultUrl: 'https://yansd666.com',
+    models: ['gemini-3.1-pro-preview', 'gemini-3-flash-preview'],
+    mappings: [
+      { claude_model: 'claude-sonnet-4-6', target_model: 'gemini-3.1-pro-preview' },
+      { claude_model: 'claude-haiku-4-5-20251000', target_model: 'gemini-3-flash-preview' },
+    ],
+  },
+}
+
+function openQuickAdd(type: PresetType) {
+  quickPreset.value = type
+  const preset = presetConfig[type]
+  quickForm.value = { name: preset.label, base_url: preset.defaultUrl, api_key: '' }
+  quickDialogVisible.value = true
+}
+
+async function submitQuickAdd() {
+  const { name, base_url, api_key } = quickForm.value
+  if (!name || !base_url || !api_key) {
+    ElMessage.warning('请填写所有字段')
+    return
+  }
+  quickSubmitting.value = true
+  try {
+    const preset = presetConfig[quickPreset.value]
+    const provider = await api.addProvider({
+      type: quickPreset.value,
+      name,
+      base_url,
+      api_key,
+      models: preset.models,
+      enabled: true,
+    })
+    const providerId = provider.id ?? (provider as any).id
+    for (const m of preset.mappings) {
+      await api.addMapping({ claude_model: m.claude_model, provider_id: providerId, target_model: m.target_model })
+    }
+    ElMessage.success(`${preset.label} 提供商和模型映射已添加`)
+    quickDialogVisible.value = false
+    emit('updated')
+  } catch {
+    ElMessage.error('添加失败')
+  } finally {
+    quickSubmitting.value = false
+  }
+}
 </script>
 
 <template>
   <div>
     <div class="toolbar">
       <h3 class="section-title">API 提供商</h3>
-      <el-button type="primary" :icon="'Plus'" @click="openAdd">添加提供商</el-button>
+      <div style="display:flex;gap:8px">
+        <el-button type="success" @click="openQuickAdd('openai')">一键添加 GPT</el-button>
+        <el-button type="warning" @click="openQuickAdd('gemini')">一键添加 Gemini</el-button>
+        <el-button type="primary" :icon="'Plus'" @click="openAdd">添加提供商</el-button>
+      </div>
     </div>
 
     <el-empty v-if="!config.providers.length" description="暂无提供商，点击添加" />
@@ -236,6 +312,40 @@ function typeTag(type: ProviderType) {
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
         <el-button type="primary" @click="submitForm">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- Quick-add Dialog -->
+    <el-dialog
+      v-model="quickDialogVisible"
+      :title="`一键添加 ${presetConfig[quickPreset].label} 提供商`"
+      width="480px"
+      destroy-on-close
+    >
+      <el-form :model="quickForm" label-width="100px">
+        <el-form-item label="名称" required>
+          <el-input v-model="quickForm.name" :placeholder="presetConfig[quickPreset].label" />
+        </el-form-item>
+        <el-form-item label="Base URL" required>
+          <el-input v-model="quickForm.base_url" />
+        </el-form-item>
+        <el-form-item label="API Key" required>
+          <el-input v-model="quickForm.api_key" type="password" show-password placeholder="sk-xxx" />
+        </el-form-item>
+        <el-form-item label="预设模型">
+          <el-tag v-for="m in presetConfig[quickPreset].models" :key="m" style="margin:2px">{{ m }}</el-tag>
+        </el-form-item>
+        <el-form-item label="模型映射">
+          <div v-for="m in presetConfig[quickPreset].mappings" :key="m.claude_model" style="font-size:13px;line-height:1.8">
+            <el-tag size="small" type="info">{{ m.claude_model }}</el-tag>
+            <span style="margin:0 6px">→</span>
+            <el-tag size="small">{{ m.target_model }}</el-tag>
+          </div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="quickDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="quickSubmitting" @click="submitQuickAdd">确认添加</el-button>
       </template>
     </el-dialog>
   </div>
