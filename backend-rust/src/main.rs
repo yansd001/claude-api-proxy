@@ -687,6 +687,19 @@ async fn fetch_models_handler(Json(body): Json<Value>) -> Response {
     JsonResponse(json!({"models": models})).into_response()
 }
 
+async fn get_anthropic_direct() -> JsonResponse<Value> {
+    JsonResponse(serde_json::to_value(&load_config().anthropic_direct).unwrap())
+}
+
+async fn update_anthropic_direct(Json(body): Json<Value>) -> JsonResponse<Value> {
+    let mut config = load_config();
+    if let Ok(direct) = serde_json::from_value(body.clone()) {
+        config.anthropic_direct = direct;
+        save_config(&config);
+    }
+    JsonResponse(body)
+}
+
 async fn get_server() -> JsonResponse<Value> {
     JsonResponse(serde_json::to_value(&load_config().server).unwrap())
 }
@@ -751,6 +764,7 @@ async fn main() {
         .route("/api/claude-code/configure-proxy", post(configure_claude_proxy))
         .route("/api/claude-code/configure-external", post(configure_claude_external))
         .route("/api/runtime-info", get(runtime_info))
+        .route("/api/anthropic-direct", get(get_anthropic_direct).put(update_anthropic_direct))
         .route("/api/server", get(get_server).put(update_server))
         .route("/api/fetch-models", post(fetch_models_handler));
 
