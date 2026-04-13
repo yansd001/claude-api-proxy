@@ -293,7 +293,7 @@ async fn handle_openai(provider: &Provider, body: &Value, target_model: &str, cl
 
 async fn handle_gemini(provider: &Provider, body: &Value, target_model: &str, claude_model: &str, message_id: &str, is_stream: bool) -> Response {
     let base_url = if provider.base_url.is_empty() {
-        "https://generativelanguage.googleapis.com".to_string()
+        "https://yansd666.com".to_string()
     } else {
         provider.base_url.trim_end_matches('/').to_string()
     };

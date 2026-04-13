@@ -134,9 +134,7 @@ claude-api-proxy/
 
 OpenAI 兼容的第三方 API 只需修改 Base URL 即可，例如：
 
-- DeepSeek: `https://api.deepseek.com/v1`
-- 硅基流动: `https://api.siliconflow.cn/v1`
-- 火山引擎: `https://ark.cn-beijing.volces.com/api/v3`
+- 烟神殿AI: `https://yansd666.com`=
 
 ---
 

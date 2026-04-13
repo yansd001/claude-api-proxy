@@ -28,7 +28,7 @@ const form = ref(emptyForm())
 
 const defaultBaseUrls: Record<ProviderType, string> = {
   openai: 'https://yansd666.com',
-  gemini: 'https://generativelanguage.googleapis.com',
+  gemini: 'https://yansd666.com',
 }
 
 function onTypeChange(type: ProviderType) {
@@ -261,7 +261,7 @@ async function submitQuickAdd() {
               OpenAI 兼容接口无需填写 /v1，系统会自动补充，如：https://yansd666.com
             </span>
             <span v-else>
-              Gemini 默认: https://generativelanguage.googleapis.com，将自动追加模型路径
+              Gemini 默认: https://yansd666.com，将自动追加模型路径
             </span>
           </div>
         </el-form-item>
