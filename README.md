@@ -9,8 +9,7 @@ Claude Code ──Anthropic格式──▶ 本代理 ──OpenAI/Responses/Gemi
 
 ## 功能
 
-- 支持 **OpenAI 兼容 API**（Chat Completions 格式：OpenAI、DeepSeek、硅基流动、火山引擎等）
-- 支持 **OpenAI Responses API**（新版 Responses 格式）
+- 支持 **OpenAI 兼容 API**
 - 支持 **Google Gemini API**
 - **智能模型路由**：请求模型名包含 `haiku` 时自动走 Haiku 模型映射，否则走默认模型映射
 - **单一活跃提供商**：同时只能启用一个提供商，切换时自动禁用其他
