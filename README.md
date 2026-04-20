@@ -1,9 +1,9 @@
 # Claude API Proxy
 
-将 Claude Code 的 Anthropic 格式请求转发到 **OpenAI 兼容 API**、**OpenAI Responses API** 或 **Google Gemini API**，并通过 Vue 前端可视化管理配置。
+将 Claude Code 的 Anthropic 格式请求转发到 **OpenAI 兼容 API** 或 **Google Gemini API**，并通过 Vue 前端可视化管理配置。
 
 ```
-Claude Code ──Anthropic格式──▶ 本代理 ──OpenAI/Responses/Gemini格式──▶ 实际 LLM
+Claude Code ──Anthropic格式──▶ 本代理 ──OpenAI/Gemini格式──▶ 实际 LLM
              ◀──────────────────────── ◀──────────────────────────────────
 ```
 
