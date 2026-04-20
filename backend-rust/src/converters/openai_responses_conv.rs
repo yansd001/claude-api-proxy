@@ -179,6 +179,7 @@ pub fn build_responses_request(anthropic_body: &Value, target_model: &str) -> Va
         "input": input,
         "max_output_tokens": max_tokens,
         "stream": stream,
+        "store": false,
     });
 
     if let Some(inst) = instructions {
@@ -209,6 +210,20 @@ pub fn build_responses_request(anthropic_body: &Value, target_model: &str) -> Va
             })
             .collect();
         req["tools"] = json!(response_tools);
+
+        // Forward tool_choice from Anthropic format
+        if let Some(tc) = anthropic_body.get("tool_choice") {
+            let tc_type = tc.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match tc_type {
+                "auto" => { req["tool_choice"] = json!("auto"); }
+                "any" => { req["tool_choice"] = json!("required"); }
+                "tool" => {
+                    let name = tc.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    req["tool_choice"] = json!({"type": "function", "name": name});
+                }
+                _ => {}
+            }
+        }
     }
 
     req
@@ -325,7 +340,12 @@ pub fn stream_responses_start(claude_model: &str, message_id: &str) -> Vec<Strin
 pub struct ResponsesStreamState {
     pub next_index: usize,
     pub text_block_index: i32,
+    /// item.id → block_idx  (delta events use item_id = item.id)
     pub tool_block_map: HashMap<String, usize>,
+    /// item.id → call_id  (call_id is used as Anthropic tool_use.id)
+    pub item_id_to_call_id: HashMap<String, String>,
+    /// item.id → name
+    pub item_id_to_name: HashMap<String, String>,
     pub stop_reason: String,
     pub output_tokens: u64,
     pub input_tokens: u64,
@@ -339,6 +359,8 @@ impl Default for ResponsesStreamState {
             next_index: 0,
             text_block_index: -1,
             tool_block_map: HashMap::new(),
+            item_id_to_call_id: HashMap::new(),
+            item_id_to_name: HashMap::new(),
             stop_reason: "end_turn".to_string(),
             output_tokens: 0,
             input_tokens: 0,
@@ -400,15 +422,16 @@ pub fn process_responses_stream_line(line: &str, state: &mut ResponsesStreamStat
                 state.text_block_index = -1;
             }
         }
-        // Function call start
+        // Function call arguments streaming
         "response.function_call_arguments.delta" => {
-            let call_id = chunk.get("call_id").and_then(|i| i.as_str())
-                .or_else(|| chunk.get("item_id").and_then(|i| i.as_str()))
+            // delta events carry item_id = item.id (NOT call_id)
+            let item_id = chunk.get("item_id").and_then(|i| i.as_str())
+                .or_else(|| chunk.get("call_id").and_then(|i| i.as_str()))
                 .unwrap_or("");
             let delta_args = chunk.get("delta").and_then(|d| d.as_str()).unwrap_or("");
 
-            if !state.tool_block_map.contains_key(call_id) {
-                // Close text block if open
+            if !state.tool_block_map.contains_key(item_id) {
+                // Fallback: response.output_item.added may not have fired yet
                 if state.text_block_index != -1 {
                     events.push(sse("content_block_stop", &json!({
                         "type": "content_block_stop",
@@ -419,9 +442,10 @@ pub fn process_responses_stream_line(line: &str, state: &mut ResponsesStreamStat
 
                 let block_idx = state.next_index;
                 state.next_index += 1;
-                state.tool_block_map.insert(call_id.to_string(), block_idx);
+                state.tool_block_map.insert(item_id.to_string(), block_idx);
 
-                let name = chunk.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let call_id = state.item_id_to_call_id.get(item_id).map(|s| s.as_str()).unwrap_or(item_id);
+                let name = state.item_id_to_name.get(item_id).map(|s| s.as_str()).unwrap_or("");
                 events.push(sse("content_block_start", &json!({
                     "type": "content_block_start",
                     "index": block_idx,
@@ -435,7 +459,7 @@ pub fn process_responses_stream_line(line: &str, state: &mut ResponsesStreamStat
             }
 
             if !delta_args.is_empty() {
-                let block_idx = state.tool_block_map.get(call_id).copied().unwrap_or(0);
+                let block_idx = state.tool_block_map.get(item_id).copied().unwrap_or(0);
                 events.push(sse("content_block_delta", &json!({
                     "type": "content_block_delta",
                     "index": block_idx,
@@ -445,10 +469,10 @@ pub fn process_responses_stream_line(line: &str, state: &mut ResponsesStreamStat
         }
         // Function call done
         "response.function_call_arguments.done" => {
-            let call_id = chunk.get("call_id").and_then(|i| i.as_str())
-                .or_else(|| chunk.get("item_id").and_then(|i| i.as_str()))
+            let item_id = chunk.get("item_id").and_then(|i| i.as_str())
+                .or_else(|| chunk.get("call_id").and_then(|i| i.as_str()))
                 .unwrap_or("");
-            if let Some(&block_idx) = state.tool_block_map.get(call_id) {
+            if let Some(&block_idx) = state.tool_block_map.get(item_id) {
                 events.push(sse("content_block_stop", &json!({
                     "type": "content_block_stop",
                     "index": block_idx,
@@ -456,15 +480,20 @@ pub fn process_responses_stream_line(line: &str, state: &mut ResponsesStreamStat
             }
             state.stop_reason = "tool_use".to_string();
         }
-        // Output item added (function_call) — need to capture name and call_id
+        // Output item added — captures name and call_id before arguments start streaming
         "response.output_item.added" => {
             if let Some(item) = chunk.get("item") {
                 let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 if item_type == "function_call" {
-                    let call_id = item.get("call_id").and_then(|i| i.as_str())
-                        .or_else(|| item.get("id").and_then(|i| i.as_str()))
-                        .unwrap_or("");
+                    // item.id is what delta events reference via item_id
+                    let item_id = item.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                    // call_id is the Anthropic tool_use.id; if absent fall back to item.id
+                    let call_id = item.get("call_id").and_then(|i| i.as_str()).unwrap_or(item_id);
                     let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+
+                    // Store mappings for use in delta/done events
+                    state.item_id_to_call_id.insert(item_id.to_string(), call_id.to_string());
+                    state.item_id_to_name.insert(item_id.to_string(), name.to_string());
 
                     // Close text block if open
                     if state.text_block_index != -1 {
@@ -475,10 +504,11 @@ pub fn process_responses_stream_line(line: &str, state: &mut ResponsesStreamStat
                         state.text_block_index = -1;
                     }
 
-                    if !state.tool_block_map.contains_key(call_id) {
+                    if !state.tool_block_map.contains_key(item_id) {
                         let block_idx = state.next_index;
                         state.next_index += 1;
-                        state.tool_block_map.insert(call_id.to_string(), block_idx);
+                        // Key by item.id so delta events (which use item_id) can find it
+                        state.tool_block_map.insert(item_id.to_string(), block_idx);
                         events.push(sse("content_block_start", &json!({
                             "type": "content_block_start",
                             "index": block_idx,

@@ -30,7 +30,6 @@ const form = ref(emptyForm())
 
 const defaultBaseUrls: Record<ProviderType, string> = {
   openai: 'https://api.openai.com',
-  openai_responses: 'https://api.openai.com',
   gemini: 'https://generativelanguage.googleapis.com',
 }
 
@@ -141,13 +140,11 @@ async function toggleEnabled(p: Provider) {
 
 function typeTag(type: ProviderType) {
   if (type === 'gemini') return 'success'
-  if (type === 'openai_responses') return 'warning'
   return 'primary'
 }
 
 function typeLabel(type: ProviderType) {
   if (type === 'openai') return 'OpenAI'
-  if (type === 'openai_responses') return 'Responses'
   if (type === 'gemini') return 'Gemini'
   return type
 }
@@ -187,13 +184,11 @@ const quickSubmitting = ref(false)
 
 const quickPresetModels: Record<ProviderType, { default_model: string; haiku_model: string }> = {
   openai: { default_model: 'gpt-5.4', haiku_model: 'gpt-5.4-mini' },
-  openai_responses: { default_model: 'gpt-5.4', haiku_model: 'gpt-5.4-mini' },
   gemini: { default_model: 'gemini-3.1-pro-preview', haiku_model: 'gemini-3-flash-preview' },
 }
 
 const quickTypeLabels: Record<ProviderType, string> = {
   openai: 'OpenAI 兼容',
-  openai_responses: 'OpenAI Responses',
   gemini: 'Google Gemini',
 }
 
@@ -322,7 +317,6 @@ async function submitQuickAdd() {
         <el-form-item label="类型" required>
           <el-radio-group v-model="form.type" @change="onTypeChange(form.type)">
             <el-radio-button value="openai">OpenAI 兼容</el-radio-button>
-            <el-radio-button value="openai_responses">OpenAI Responses</el-radio-button>
             <el-radio-button value="gemini">Google Gemini</el-radio-button>
           </el-radio-group>
         </el-form-item>
@@ -332,7 +326,7 @@ async function submitQuickAdd() {
         <el-form-item label="Base URL" required>
           <el-input v-model="form.base_url" placeholder="https://api.openai.com" />
           <div class="hint">
-            <span v-if="form.type === 'openai' || form.type === 'openai_responses'">
+            <span v-if="form.type === 'openai'">
               OpenAI 接口无需填写 /v1，系统会自动补充
             </span>
             <span v-else>
@@ -416,7 +410,6 @@ async function submitQuickAdd() {
         <el-form-item label="提供商类型" required>
           <el-radio-group v-model="quickType" @change="onQuickTypeChange">
             <el-radio-button value="openai">OpenAI 兼容</el-radio-button>
-            <el-radio-button value="openai_responses">OpenAI Responses</el-radio-button>
             <el-radio-button value="gemini">Google Gemini</el-radio-button>
           </el-radio-group>
         </el-form-item>

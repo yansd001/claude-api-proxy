@@ -15,7 +15,6 @@ use axum::{
 use config::{Config, Provider, load_config, new_provider_id, save_config};
 use converters::gemini_conv;
 use converters::openai_conv;
-use converters::openai_responses_conv;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -189,7 +188,6 @@ async fn messages_handler(req: Request) -> Response {
 
     match provider_type.as_str() {
         "openai" => handle_openai(&provider, &body, &target_model, claude_model, &message_id, is_stream).await,
-        "openai_responses" => handle_openai_responses(&provider, &body, &target_model, claude_model, &message_id, is_stream).await,
         "gemini" => handle_gemini(&provider, &body, &target_model, claude_model, &message_id, is_stream).await,
         _ => (StatusCode::BAD_REQUEST, JsonResponse(json!({"detail": format!("Unknown provider type: {}", provider_type)}))).into_response(),
     }
@@ -288,99 +286,6 @@ async fn handle_openai(provider: &Provider, body: &Value, target_model: &str, cl
     }
     let openai_resp: Value = serde_json::from_str(&body_text).unwrap_or(json!({}));
     JsonResponse(openai_conv::convert_openai_response(&openai_resp, claude_model, message_id)).into_response()
-}
-
-async fn handle_openai_responses(provider: &Provider, body: &Value, target_model: &str, claude_model: &str, message_id: &str, is_stream: bool) -> Response {
-    let mut base_url = provider.base_url.trim_end_matches('/').to_string();
-    if !base_url.ends_with("/v1") {
-        base_url = format!("{}/v1", base_url);
-    }
-    let url = format!("{}/responses", base_url);
-    let responses_req = openai_responses_conv::build_responses_request(body, target_model);
-    let headers = make_auth_headers(provider);
-    let client = reqwest::Client::new();
-
-    if is_stream {
-        let claude_model = claude_model.to_string();
-        let message_id = message_id.to_string();
-
-        let resp = match client.post(&url).headers(headers).json(&responses_req).timeout(std::time::Duration::from_secs(600)).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                return (StatusCode::BAD_GATEWAY, JsonResponse(json!({"detail": e.to_string()}))).into_response();
-            }
-        };
-
-        if resp.status().is_client_error() || resp.status().is_server_error() {
-            let err_body = resp.text().await.unwrap_or_default();
-            let event = format!("data: {}\n\n", err_body);
-            return Response::builder()
-                .header("content-type", "text/event-stream")
-                .body(Body::from(event))
-                .unwrap();
-        }
-
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
-
-        tokio::spawn(async move {
-            for event in openai_responses_conv::stream_responses_start(&claude_model, &message_id) {
-                if tx.send(Ok(event)).await.is_err() { return; }
-            }
-
-            let mut state = openai_responses_conv::ResponsesStreamState::default();
-            let mut stream = resp.bytes_stream();
-            let mut buffer = String::new();
-
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(bytes) => {
-                        buffer.push_str(&String::from_utf8_lossy(&bytes));
-                        while let Some(pos) = buffer.find('\n') {
-                            let line = buffer[..pos].to_string();
-                            buffer = buffer[pos + 1..].to_string();
-                            for event in openai_responses_conv::process_responses_stream_line(&line, &mut state) {
-                                if tx.send(Ok(event)).await.is_err() { return; }
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            if !buffer.trim().is_empty() {
-                for event in openai_responses_conv::process_responses_stream_line(&buffer, &mut state) {
-                    let _ = tx.send(Ok(event)).await;
-                }
-            }
-
-            for event in openai_responses_conv::stream_responses_end(&state) {
-                let _ = tx.send(Ok(event)).await;
-            }
-        });
-
-        let stream = ReceiverStream::new(rx);
-        let body = Body::from_stream(stream);
-        return Response::builder()
-            .header("content-type", "text/event-stream")
-            .body(body)
-            .unwrap();
-    }
-
-    // Non-streaming
-    let resp = match client.post(&url).headers(headers).json(&responses_req).timeout(std::time::Duration::from_secs(600)).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            return (StatusCode::BAD_GATEWAY, JsonResponse(json!({"detail": e.to_string()}))).into_response();
-        }
-    };
-
-    let status = resp.status();
-    let body_text = resp.text().await.unwrap_or_default();
-    if status.is_client_error() || status.is_server_error() {
-        let val: Value = serde_json::from_str(&body_text).unwrap_or(json!({"detail": body_text}));
-        return (StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), JsonResponse(val)).into_response();
-    }
-    let responses_resp: Value = serde_json::from_str(&body_text).unwrap_or(json!({}));
-    JsonResponse(openai_responses_conv::convert_responses_response(&responses_resp, claude_model, message_id)).into_response()
 }
 
 async fn handle_gemini(provider: &Provider, body: &Value, target_model: &str, claude_model: &str, message_id: &str, is_stream: bool) -> Response {

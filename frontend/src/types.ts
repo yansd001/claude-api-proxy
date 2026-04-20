@@ -1,4 +1,4 @@
-export type ProviderType = 'openai' | 'openai_responses' | 'gemini'
+export type ProviderType = 'openai' | 'gemini'
 
 export interface Provider {
   id: string
