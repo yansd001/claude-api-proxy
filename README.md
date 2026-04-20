@@ -1,17 +1,20 @@
 # Claude API Proxy
 
-将 Claude Code 的 Anthropic 格式请求转发到 **OpenAI 兼容 API** 或 **Google Gemini API**，并通过 Vue 前端可视化管理配置。
+将 Claude Code 的 Anthropic 格式请求转发到 **OpenAI 兼容 API**、**OpenAI Responses API** 或 **Google Gemini API**，并通过 Vue 前端可视化管理配置。
 
 ```
-Claude Code ──Anthropic格式──▶ 本代理 ──OpenAI/Gemini格式──▶ 实际 LLM
-             ◀──────────────────────── ◀──────────────────────────
+Claude Code ──Anthropic格式──▶ 本代理 ──OpenAI/Responses/Gemini格式──▶ 实际 LLM
+             ◀──────────────────────── ◀──────────────────────────────────
 ```
 
 ## 功能
 
-- 支持 **OpenAI 兼容 API**（OpenAI、DeepSeek、硅基流动、火山引擎等）
+- 支持 **OpenAI 兼容 API**（Chat Completions 格式：OpenAI、DeepSeek、硅基流动、火山引擎等）
+- 支持 **OpenAI Responses API**（新版 Responses 格式）
 - 支持 **Google Gemini API**
-- **模型映射**：将 Claude Code 发送的模型名（如 `claude-sonnet-4-6`）映射到任意目标模型
+- **智能模型路由**：请求模型名包含 `haiku` 时自动走 Haiku 模型映射，否则走默认模型映射
+- **单一活跃提供商**：同时只能启用一个提供商，切换时自动禁用其他
+- **表格内联编辑**：在提供商列表中直接选择默认模型映射和 Haiku 模型映射，点击时自动获取远端模型列表
 - **流式响应**（Streaming）完整支持，含工具调用（Function Calling）
 - **Vue 可视化配置界面**，无需手动编辑 JSON
 - **Rust 原生编译**，单文件二进制仅约 2.4MB
@@ -69,8 +72,10 @@ npm run dev
 ### 3. 在配置界面中设置
 
 1. **接入信息** 标签页：查看并复制代理的 `ANTHROPIC_BASE_URL` 和 `ANTHROPIC_API_KEY`。
-2. **提供商** 标签页：添加 OpenAI 或 Gemini 提供商，填写 Base URL、API Key 和可用模型列表。
-3. **模型映射** 标签页：设置 Claude Code 模型名到实际提供商模型的映射关系，并配置默认路由。
+2. **提供商** 标签页：添加 OpenAI / OpenAI Responses / Gemini 提供商，填写 Base URL 和 API Key。
+   - 在提供商列表的「默认模型映射」和「Haiku模型映射」列中直接选择目标模型（点击时自动从远端获取模型列表）。
+   - 请求中模型名包含 `haiku` 时走 Haiku 模型映射，否则走默认模型映射；未设置 Haiku 映射时回退到默认模型。
+   - 同时只能启用一个提供商。
 
 ### 4. 启动 Claude Code
 
@@ -86,15 +91,17 @@ claude
 ANTHROPIC_BASE_URL=http://localhost:8000 ANTHROPIC_API_KEY=<key> claude
 ```
 
-## 模型映射示例
+## 模型映射说明
 
-| Claude Code 发送的模型     | 转发到提供商    | 目标模型名              |
-| -------------------------- | -------------- | ----------------------- |
-| `claude-sonnet-4-6`        | OpenAI         | `gpt-4o`               |
-| `claude-3-5-haiku-20241022`| Gemini         | `gemini-2.5-flash`     |
-| `claude-opus-4-5`          | DeepSeek       | `deepseek-chat`        |
+每个提供商可配置两个模型映射：
 
-未命中映射时，使用"默认路由"中设置的提供商和模型。
+| 映射类型       | 触发条件                         | 示例目标模型            |
+| -------------- | -------------------------------- | ----------------------- |
+| **默认模型映射** | 请求模型名不含 `haiku`          | `gpt-4o` / `gemini-2.5-pro` |
+| **Haiku模型映射** | 请求模型名包含 `haiku`          | `gpt-4o-mini` / `gemini-2.5-flash` |
+
+- 若未设置 Haiku 模型映射，haiku 请求也会走默认模型映射
+- 同时只能启用一个提供商，切换启用时其他提供商自动禁用
 
 ## 项目结构
 
@@ -108,15 +115,15 @@ claude-api-proxy/
 │       ├── auth.rs               # API Key 鉴权中间件
 │       └── converters/
 │           ├── mod.rs
-│           ├── openai_conv.rs    # Anthropic ↔ OpenAI 格式转换
-│           └── gemini_conv.rs    # Anthropic ↔ Gemini 格式转换
+│           ├── openai_conv.rs          # Anthropic ↔ OpenAI Chat Completions 格式转换
+│           ├── openai_responses_conv.rs # Anthropic ↔ OpenAI Responses 格式转换
+│           └── gemini_conv.rs          # Anthropic ↔ Gemini 格式转换
 ├── frontend/
 │   ├── src/
 │   │   ├── App.vue
 │   │   ├── components/
 │   │   │   ├── ServerInfo.vue       # 接入信息与服务器设置
-│   │   │   ├── ProviderList.vue     # 提供商管理
-│   │   │   └── ModelMappings.vue    # 模型映射管理
+│   │   │   └── ProviderList.vue     # 提供商管理与模型映射
 │   │   ├── api.ts            # 与后端的 API 调用封装
 │   │   └── types.ts          # TypeScript 类型定义
 │   └── package.json
@@ -127,10 +134,11 @@ claude-api-proxy/
 
 ## Provider Base URL 说明
 
-| 类型   | 默认 Base URL                                        | 实际调用路径                              |
-| ------ | ---------------------------------------------------- | ----------------------------------------- |
-| OpenAI | `https://api.openai.com/v1`                          | `{base_url}/chat/completions`             |
-| Gemini | `https://generativelanguage.googleapis.com`          | `{base_url}/v1beta/models/{model}:generateContent?key={api_key}` |
+| 类型              | 默认 Base URL                                        | 实际调用路径                              |
+| ----------------- | ---------------------------------------------------- | ----------------------------------------- |
+| OpenAI 兼容       | `https://api.openai.com`                             | `{base_url}/v1/chat/completions`          |
+| OpenAI Responses  | `https://api.openai.com`                             | `{base_url}/v1/responses`                 |
+| Gemini            | `https://generativelanguage.googleapis.com`          | `{base_url}/v1beta/models/{model}:generateContent?key={api_key}` |
 
 OpenAI 兼容的第三方 API 只需修改 Base URL 即可，例如：
 

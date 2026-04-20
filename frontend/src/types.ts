@@ -1,4 +1,4 @@
-export type ProviderType = 'openai' | 'gemini'
+export type ProviderType = 'openai' | 'openai_responses' | 'gemini'
 
 export interface Provider {
   id: string
@@ -8,6 +8,8 @@ export interface Provider {
   api_key: string
   models: string[]   // list of available model names on this provider
   enabled: boolean
+  default_model: string   // default model mapping
+  haiku_model: string     // haiku model mapping
 }
 
 export interface ModelMapping {

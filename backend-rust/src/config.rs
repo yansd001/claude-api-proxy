@@ -58,6 +58,10 @@ pub struct Provider {
     pub models: Vec<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub default_model: String,
+    #[serde(default)]
+    pub haiku_model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

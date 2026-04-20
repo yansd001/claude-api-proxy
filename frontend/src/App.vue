@@ -5,7 +5,6 @@ import { api } from './api'
 import type { AppConfig } from './types'
 import ServerInfo from './components/ServerInfo.vue'
 import ProviderList from './components/ProviderList.vue'
-import ModelMappings from './components/ModelMappings.vue'
 
 const config = ref<AppConfig | null>(null)
 const loading = ref(true)
@@ -47,14 +46,6 @@ onMounted(loadConfig)
           </template>
           <ProviderList :config="config" @updated="loadConfig" />
         </el-tab-pane>
-
-        <!-- Tab 3: Model Mappings -->
-        <el-tab-pane>
-          <template #label>
-            <el-icon><Share /></el-icon> 模型映射
-          </template>
-          <ModelMappings :config="config" @updated="loadConfig" />
-        </el-tab-pane>
       </el-tabs>
     </el-container>
 
@@ -72,7 +63,7 @@ body {
   background: #f0f2f5;
 }
 .app-wrapper {
-  max-width: 960px;
+  max-width: 1080px;
   margin: 0 auto;
   padding: 24px 16px 48px;
 }
