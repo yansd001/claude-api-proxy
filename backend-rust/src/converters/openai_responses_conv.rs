@@ -2,10 +2,18 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
-// Request: Anthropic → OpenAI Responses API
+// Request: Anthropic Messages → OpenAI Responses API
 // ---------------------------------------------------------------------------
+// OpenAI Responses API: POST /v1/responses
+// Key differences from Chat Completions:
+//   - Uses "input" instead of "messages"
+//   - Uses "max_output_tokens" instead of "max_tokens"
+//   - System prompt goes into a system message inside "input"
+//   - Tool results use "function_call_output" type
+//   - Streaming events are different (response.output_text.delta, etc.)
+//   - Response shape uses "output" array with content items
 
-fn user_content_blocks_to_responses(blocks: &[Value]) -> Vec<Value> {
+fn user_content_blocks_to_responses(blocks: &[Value]) -> Value {
     let mut parts: Vec<Value> = Vec::new();
     for block in blocks {
         let btype = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -20,8 +28,10 @@ fn user_content_blocks_to_responses(blocks: &[Value]) -> Vec<Value> {
                     if src_type == "base64" {
                         let media = source.get("media_type").and_then(|t| t.as_str()).unwrap_or("");
                         let data = source.get("data").and_then(|t| t.as_str()).unwrap_or("");
-                        let data_url = format!("data:{};base64,{}", media, data);
-                        parts.push(json!({"type": "input_image", "image_url": data_url}));
+                        parts.push(json!({
+                            "type": "input_image",
+                            "image_url": format!("data:{};base64,{}", media, data),
+                        }));
                     } else if src_type == "url" {
                         let url = source.get("url").and_then(|t| t.as_str()).unwrap_or("");
                         parts.push(json!({"type": "input_image", "image_url": url}));
@@ -31,28 +41,39 @@ fn user_content_blocks_to_responses(blocks: &[Value]) -> Vec<Value> {
             _ => {}
         }
     }
-    parts
+    if parts.len() == 1 && parts[0].get("type").and_then(|t| t.as_str()) == Some("input_text") {
+        // Simplify to plain string for single text
+        parts[0].get("text").cloned().unwrap_or(json!(""))
+    } else if parts.is_empty() {
+        json!("")
+    } else {
+        json!(parts)
+    }
 }
 
-fn anthropic_to_responses_input(messages: &[Value], system: Option<&Value>) -> (Option<String>, Vec<Value>) {
-    let mut input: Vec<Value> = Vec::new();
-    let mut instructions: Option<String> = None;
+fn anthropic_messages_to_responses_input(messages: &[Value], system: Option<&Value>) -> Vec<Value> {
+    let mut result: Vec<Value> = Vec::new();
 
-    // System → instructions
+    // Add system message as a system role item
     if let Some(sys) = system {
         if !sys.is_null() {
             let sys_text = match sys {
-                Value::String(s) => s.clone(),
-                Value::Array(arr) => arr
-                    .iter()
-                    .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-                _ => String::new(),
+                Value::String(s) if !s.is_empty() => Some(s.clone()),
+                Value::Array(arr) => {
+                    let text = arr
+                        .iter()
+                        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if text.is_empty() { None } else { Some(text) }
+                }
+                _ => None,
             };
-            if !sys_text.is_empty() {
-                instructions = Some(sys_text);
+            if let Some(text) = sys_text {
+                result.push(json!({
+                    "role": "system",
+                    "content": text,
+                }));
             }
         }
     }
@@ -61,24 +82,15 @@ fn anthropic_to_responses_input(messages: &[Value], system: Option<&Value>) -> (
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         let content = msg.get("content").unwrap_or(&json!(null));
 
-        if content.is_string() {
-            let text = content.as_str().unwrap_or("");
-            if role == "user" {
-                input.push(json!({
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": text}]
-                }));
-            } else if role == "assistant" {
-                input.push(json!({
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": text}]
-                }));
-            }
+        if let Some(s) = content.as_str() {
+            // Simple string content
+            result.push(json!({"role": role, "content": s}));
             continue;
         }
 
         if let Some(blocks) = content.as_array() {
             if role == "user" {
+                // Separate tool results from regular user content
                 let tool_results: Vec<&Value> = blocks
                     .iter()
                     .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
@@ -91,7 +103,6 @@ fn anthropic_to_responses_input(messages: &[Value], system: Option<&Value>) -> (
                     })
                     .collect();
 
-                // tool_results → function_call_output items
                 for tr in &tool_results {
                     let default_content = json!("");
                     let tr_content = tr.get("content").unwrap_or(&default_content);
@@ -106,20 +117,19 @@ fn anthropic_to_responses_input(messages: &[Value], system: Option<&Value>) -> (
                     } else {
                         String::new()
                     };
-                    let call_id = tr.get("tool_use_id").and_then(|t| t.as_str()).unwrap_or("");
-                    input.push(json!({
+
+                    let tool_use_id = tr.get("tool_use_id").and_then(|t| t.as_str()).unwrap_or("");
+                    result.push(json!({
                         "type": "function_call_output",
-                        "call_id": call_id,
+                        "call_id": tool_use_id,
                         "output": content_str,
                     }));
                 }
 
                 if !other.is_empty() {
                     let other_owned: Vec<Value> = other.into_iter().cloned().collect();
-                    let parts = user_content_blocks_to_responses(&other_owned);
-                    if !parts.is_empty() {
-                        input.push(json!({"role": "user", "content": parts}));
-                    }
+                    let converted = user_content_blocks_to_responses(&other_owned);
+                    result.push(json!({"role": "user", "content": converted}));
                 }
             } else if role == "assistant" {
                 let text_parts: Vec<&str> = blocks
@@ -132,43 +142,39 @@ fn anthropic_to_responses_input(messages: &[Value], system: Option<&Value>) -> (
                     .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
                     .collect();
 
-                // Add assistant text as output_text content
+                // In Responses API, text goes as an assistant message,
+                // and tool calls become top-level "function_call" items in the input array.
                 if !text_parts.is_empty() {
-                    input.push(json!({
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": text_parts.join("\n")}]
-                    }));
+                    result.push(json!({"role": "assistant", "content": text_parts.join("\n")}));
                 }
 
-                // Add tool_use as function_call items
                 for tu in &tool_uses {
                     let id = tu.get("id").and_then(|i| i.as_str()).unwrap_or("");
                     let name = tu.get("name").and_then(|n| n.as_str()).unwrap_or("");
                     let default_input = json!({});
-                    let inp = tu.get("input").unwrap_or(&default_input);
-                    input.push(json!({
+                    let input = tu.get("input").unwrap_or(&default_input);
+                    result.push(json!({
                         "type": "function_call",
-                        "id": id,
                         "call_id": id,
                         "name": name,
-                        "arguments": serde_json::to_string(inp).unwrap_or_default(),
+                        "arguments": serde_json::to_string(input).unwrap_or_default(),
                     }));
                 }
             }
         }
     }
 
-    (instructions, input)
+    result
 }
 
 pub fn build_responses_request(anthropic_body: &Value, target_model: &str) -> Value {
     let messages = anthropic_body.get("messages").and_then(|m| m.as_array());
     let system = anthropic_body.get("system");
 
-    let (instructions, input) = if let Some(msgs) = messages {
-        anthropic_to_responses_input(msgs, system)
+    let input = if let Some(msgs) = messages {
+        anthropic_messages_to_responses_input(msgs, system)
     } else {
-        (None, Vec::new())
+        Vec::new()
     };
 
     let max_tokens = anthropic_body.get("max_tokens").and_then(|m| m.as_u64()).unwrap_or(4096);
@@ -179,12 +185,7 @@ pub fn build_responses_request(anthropic_body: &Value, target_model: &str) -> Va
         "input": input,
         "max_output_tokens": max_tokens,
         "stream": stream,
-        "store": false,
     });
-
-    if let Some(inst) = instructions {
-        req["instructions"] = json!(inst);
-    }
 
     for key in &["temperature", "top_p"] {
         if let Some(val) = anthropic_body.get(*key) {
@@ -192,9 +193,9 @@ pub fn build_responses_request(anthropic_body: &Value, target_model: &str) -> Va
         }
     }
 
-    // Convert Anthropic tools to Responses function tools
+    // Tools
     if let Some(tools) = anthropic_body.get("tools").and_then(|t| t.as_array()) {
-        let response_tools: Vec<Value> = tools
+        let responses_tools: Vec<Value> = tools
             .iter()
             .map(|t| {
                 let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -209,9 +210,8 @@ pub fn build_responses_request(anthropic_body: &Value, target_model: &str) -> Va
                 })
             })
             .collect();
-        req["tools"] = json!(response_tools);
+        req["tools"] = json!(responses_tools);
 
-        // Forward tool_choice from Anthropic format
         if let Some(tc) = anthropic_body.get("tool_choice") {
             let tc_type = tc.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match tc_type {
@@ -219,7 +219,7 @@ pub fn build_responses_request(anthropic_body: &Value, target_model: &str) -> Va
                 "any" => { req["tool_choice"] = json!("required"); }
                 "tool" => {
                     let name = tc.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    req["tool_choice"] = json!({"type": "function", "name": name});
+                    req["tool_choice"] = json!({"type": "function", "function": {"name": name}});
                 }
                 _ => {}
             }
@@ -233,31 +233,40 @@ pub fn build_responses_request(anthropic_body: &Value, target_model: &str) -> Va
 // Response (non-streaming): OpenAI Responses → Anthropic
 // ---------------------------------------------------------------------------
 
+fn finish_reason_map(reason: &str) -> &str {
+    match reason {
+        "stop" => "end_turn",
+        "tool_calls" => "tool_use",
+        "length" | "max_output_tokens" => "max_tokens",
+        "content_filter" => "stop_sequence",
+        _ => "end_turn",
+    }
+}
+
 pub fn convert_responses_response(resp: &Value, claude_model: &str, message_id: &str) -> Value {
     let mut content_blocks: Vec<Value> = Vec::new();
-    let mut stop_reason = "end_turn".to_string();
 
+    // Responses API: output is an array of output items
     if let Some(output) = resp.get("output").and_then(|o| o.as_array()) {
         for item in output {
             let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match item_type {
                 "message" => {
-                    if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
-                        for part in content {
-                            let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                            if part_type == "output_text" {
-                                let text = part.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                                if !text.is_empty() {
-                                    content_blocks.push(json!({"type": "text", "text": text}));
+                    if let Some(content_arr) = item.get("content").and_then(|c| c.as_array()) {
+                        for c in content_arr {
+                            let ctype = c.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                            if ctype == "output_text" {
+                                if let Some(text) = c.get("text").and_then(|t| t.as_str()) {
+                                    if !text.is_empty() {
+                                        content_blocks.push(json!({"type": "text", "text": text}));
+                                    }
                                 }
                             }
                         }
                     }
                 }
                 "function_call" => {
-                    let id = item.get("call_id").and_then(|i| i.as_str()).unwrap_or(
-                        item.get("id").and_then(|i| i.as_str()).unwrap_or("")
-                    );
+                    let id = item.get("call_id").and_then(|i| i.as_str()).unwrap_or("");
                     let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
                     let args_str = item.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
                     let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
@@ -267,31 +276,33 @@ pub fn convert_responses_response(resp: &Value, claude_model: &str, message_id: 
                         "name": name,
                         "input": input,
                     }));
-                    stop_reason = "tool_use".to_string();
                 }
                 _ => {}
             }
         }
     }
 
-    // Map status to stop_reason
-    if let Some(status) = resp.get("status").and_then(|s| s.as_str()) {
-        match status {
-            "completed" => { if stop_reason != "tool_use" { stop_reason = "end_turn".to_string(); } }
-            "incomplete" => { stop_reason = "max_tokens".to_string(); }
-            _ => {}
-        }
-    }
+    let stop_reason_raw = resp.get("stop_reason").and_then(|f| f.as_str()).unwrap_or("stop");
+    // Responses API may not include stop_reason; infer from output content
+    let has_tool_call = content_blocks.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
+    let stop_reason = if has_tool_call {
+        "tool_use"
+    } else {
+        finish_reason_map(stop_reason_raw)
+    };
 
     let default_usage = json!({});
     let usage = resp.get("usage").unwrap_or(&default_usage);
+
     let input_tokens = usage.get("input_tokens").and_then(|p| p.as_u64()).unwrap_or(0);
     let output_tokens = usage.get("output_tokens").and_then(|c| c.as_u64()).unwrap_or(0);
     let cached_tokens = usage
-        .get("input_tokens_details")
-        .and_then(|d| d.get("cached_tokens"))
+        .pointer("/input_tokens_details/cached_tokens")
         .and_then(|c| c.as_u64())
         .unwrap_or(0);
+
+    let cache_read = cached_tokens;
+    let cache_creation = if cached_tokens > 0 { 0 } else { input_tokens };
 
     json!({
         "id": message_id,
@@ -304,8 +315,8 @@ pub fn convert_responses_response(resp: &Value, claude_model: &str, message_id: 
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "cache_read_input_tokens": cached_tokens,
-            "cache_creation_input_tokens": if cached_tokens > 0 { 0 } else { input_tokens },
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_creation,
         }
     })
 }
@@ -340,12 +351,10 @@ pub fn stream_responses_start(claude_model: &str, message_id: &str) -> Vec<Strin
 pub struct ResponsesStreamState {
     pub next_index: usize,
     pub text_block_index: i32,
-    /// item.id → block_idx  (delta events use item_id = item.id)
+    // Map from item_id/call_id to block index
     pub tool_block_map: HashMap<String, usize>,
-    /// item.id → call_id  (call_id is used as Anthropic tool_use.id)
-    pub item_id_to_call_id: HashMap<String, String>,
-    /// item.id → name
-    pub item_id_to_name: HashMap<String, String>,
+    // Buffered argument JSON fragments per block index (emitted at stream end after cleanup)
+    pub tool_block_args: HashMap<usize, String>,
     pub stop_reason: String,
     pub output_tokens: u64,
     pub input_tokens: u64,
@@ -359,8 +368,7 @@ impl Default for ResponsesStreamState {
             next_index: 0,
             text_block_index: -1,
             tool_block_map: HashMap::new(),
-            item_id_to_call_id: HashMap::new(),
-            item_id_to_name: HashMap::new(),
+            tool_block_args: HashMap::new(),
             stop_reason: "end_turn".to_string(),
             output_tokens: 0,
             input_tokens: 0,
@@ -370,32 +378,37 @@ impl Default for ResponsesStreamState {
     }
 }
 
-pub fn process_responses_stream_line(line: &str, state: &mut ResponsesStreamState) -> Vec<String> {
+/// Stub kept for API symmetry; actual parsing uses process_responses_stream_event.
+/// Remove keys whose value is an empty string from a JSON object string.
+/// This prevents GPT-generated empty optional params (e.g. pages:"") from
+/// reaching the client and failing validation.
+fn strip_empty_string_values(json_str: &str) -> String {
+    if let Ok(serde_json::Value::Object(mut map)) = serde_json::from_str::<serde_json::Value>(json_str) {
+        map.retain(|_, v| v != &serde_json::Value::String(String::new()));
+        serde_json::to_string(&serde_json::Value::Object(map))
+            .unwrap_or_else(|_| json_str.to_string())
+    } else {
+        json_str.to_string()
+    }
+}
+
+#[allow(dead_code)]
+pub fn process_responses_stream_line(_line: &str, _state: &mut ResponsesStreamState) -> Vec<String> {
+    Vec::new()
+}
+
+/// Process a complete event (event_type + parsed JSON data).
+pub fn process_responses_stream_event(
+    event_type: &str,
+    data: &Value,
+    state: &mut ResponsesStreamState,
+) -> Vec<String> {
     let mut events = Vec::new();
-    let trimmed = line.trim();
-
-    // Responses API uses "event: <type>\ndata: <json>" format
-    // We receive lines one at a time, so we look for "data:" lines
-    if !trimmed.starts_with("data:") {
-        return events;
-    }
-    let raw = trimmed[5..].trim();
-    if raw.is_empty() || raw == "[DONE]" {
-        return events;
-    }
-
-    let chunk: Value = match serde_json::from_str(raw) {
-        Ok(v) => v,
-        Err(_) => return events,
-    };
-
-    let event_type = chunk.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
     match event_type {
-        // Text output delta
         "response.output_text.delta" => {
-            let delta_text = chunk.get("delta").and_then(|d| d.as_str()).unwrap_or("");
-            if !delta_text.is_empty() {
+            let delta = data.get("delta").and_then(|d| d.as_str()).unwrap_or("");
+            if !delta.is_empty() {
                 if state.text_block_index == -1 {
                     state.text_block_index = state.next_index as i32;
                     state.next_index += 1;
@@ -408,93 +421,16 @@ pub fn process_responses_stream_line(line: &str, state: &mut ResponsesStreamStat
                 events.push(sse("content_block_delta", &json!({
                     "type": "content_block_delta",
                     "index": state.text_block_index,
-                    "delta": {"type": "text_delta", "text": delta_text},
+                    "delta": {"type": "text_delta", "text": delta},
                 })));
             }
         }
-        // Text output done
-        "response.output_text.done" => {
-            if state.text_block_index != -1 {
-                events.push(sse("content_block_stop", &json!({
-                    "type": "content_block_stop",
-                    "index": state.text_block_index,
-                })));
-                state.text_block_index = -1;
-            }
-        }
-        // Function call arguments streaming
-        "response.function_call_arguments.delta" => {
-            // delta events carry item_id = item.id (NOT call_id)
-            let item_id = chunk.get("item_id").and_then(|i| i.as_str())
-                .or_else(|| chunk.get("call_id").and_then(|i| i.as_str()))
-                .unwrap_or("");
-            let delta_args = chunk.get("delta").and_then(|d| d.as_str()).unwrap_or("");
 
-            if !state.tool_block_map.contains_key(item_id) {
-                // Fallback: response.output_item.added may not have fired yet
-                if state.text_block_index != -1 {
-                    events.push(sse("content_block_stop", &json!({
-                        "type": "content_block_stop",
-                        "index": state.text_block_index,
-                    })));
-                    state.text_block_index = -1;
-                }
-
-                let block_idx = state.next_index;
-                state.next_index += 1;
-                state.tool_block_map.insert(item_id.to_string(), block_idx);
-
-                let call_id = state.item_id_to_call_id.get(item_id).map(|s| s.as_str()).unwrap_or(item_id);
-                let name = state.item_id_to_name.get(item_id).map(|s| s.as_str()).unwrap_or("");
-                events.push(sse("content_block_start", &json!({
-                    "type": "content_block_start",
-                    "index": block_idx,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": call_id,
-                        "name": name,
-                        "input": {},
-                    }
-                })));
-            }
-
-            if !delta_args.is_empty() {
-                let block_idx = state.tool_block_map.get(item_id).copied().unwrap_or(0);
-                events.push(sse("content_block_delta", &json!({
-                    "type": "content_block_delta",
-                    "index": block_idx,
-                    "delta": {"type": "input_json_delta", "partial_json": delta_args},
-                })));
-            }
-        }
-        // Function call done
-        "response.function_call_arguments.done" => {
-            let item_id = chunk.get("item_id").and_then(|i| i.as_str())
-                .or_else(|| chunk.get("call_id").and_then(|i| i.as_str()))
-                .unwrap_or("");
-            if let Some(&block_idx) = state.tool_block_map.get(item_id) {
-                events.push(sse("content_block_stop", &json!({
-                    "type": "content_block_stop",
-                    "index": block_idx,
-                })));
-            }
-            state.stop_reason = "tool_use".to_string();
-        }
-        // Output item added — captures name and call_id before arguments start streaming
         "response.output_item.added" => {
-            if let Some(item) = chunk.get("item") {
+            // A new output item is starting; if it's a function_call, open a tool_use block
+            if let Some(item) = data.get("item") {
                 let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 if item_type == "function_call" {
-                    // item.id is what delta events reference via item_id
-                    let item_id = item.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                    // call_id is the Anthropic tool_use.id; if absent fall back to item.id
-                    let call_id = item.get("call_id").and_then(|i| i.as_str()).unwrap_or(item_id);
-                    let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
-
-                    // Store mappings for use in delta/done events
-                    state.item_id_to_call_id.insert(item_id.to_string(), call_id.to_string());
-                    state.item_id_to_name.insert(item_id.to_string(), name.to_string());
-
                     // Close text block if open
                     if state.text_block_index != -1 {
                         events.push(sse("content_block_stop", &json!({
@@ -503,50 +439,72 @@ pub fn process_responses_stream_line(line: &str, state: &mut ResponsesStreamStat
                         })));
                         state.text_block_index = -1;
                     }
-
-                    if !state.tool_block_map.contains_key(item_id) {
-                        let block_idx = state.next_index;
-                        state.next_index += 1;
-                        // Key by item.id so delta events (which use item_id) can find it
-                        state.tool_block_map.insert(item_id.to_string(), block_idx);
-                        events.push(sse("content_block_start", &json!({
-                            "type": "content_block_start",
-                            "index": block_idx,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": call_id,
-                                "name": name,
-                                "input": {},
-                            }
-                        })));
+                    // item.id = "fc_xxx" (used in delta events as item_id)
+                    // item.call_id = "call_xxx" (used as tool_use.id for Claude Code)
+                    let item_id = item.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                    let call_id = item.get("call_id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                    let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    let block_idx = state.next_index;
+                    state.next_index += 1;
+                    // Store both item_id and call_id so we can find the block from either
+                    if !item_id.is_empty() {
+                        state.tool_block_map.insert(item_id, block_idx);
                     }
+                    if !call_id.is_empty() {
+                        state.tool_block_map.insert(call_id.clone(), block_idx);
+                    }
+                    events.push(sse("content_block_start", &json!({
+                        "type": "content_block_start",
+                        "index": block_idx,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": call_id,
+                            "name": name,
+                            "input": {},
+                        }
+                    })));
                 }
             }
         }
-        // Response completed with usage
-        "response.completed" => {
-            if let Some(response) = chunk.get("response") {
-                if let Some(status) = response.get("status").and_then(|s| s.as_str()) {
-                    match status {
-                        "completed" => { if state.tool_block_map.is_empty() { state.stop_reason = "end_turn".to_string(); } }
-                        "incomplete" => { state.stop_reason = "max_tokens".to_string(); }
-                        _ => {}
-                    }
+
+        "response.function_call_arguments.delta" => {
+            let delta = data.get("delta").and_then(|d| d.as_str()).unwrap_or("");
+            if !delta.is_empty() {
+                // Responses API delta events carry item_id ("fc_xxx"), not call_id
+                let block_idx = if let Some(iid) = data.get("item_id").and_then(|i| i.as_str()) {
+                    state.tool_block_map.get(iid).copied()
+                } else if let Some(cid) = data.get("call_id").and_then(|i| i.as_str()) {
+                    state.tool_block_map.get(cid).copied()
+                } else {
+                    None
+                };
+                // Buffer instead of emitting immediately; will be cleaned and emitted in stream_responses_end
+                if let Some(idx) = block_idx {
+                    state.tool_block_args.entry(idx).or_insert_with(String::new).push_str(delta);
                 }
+            }
+        }
+
+        "response.completed" => {
+            if let Some(response) = data.get("response") {
                 if let Some(usage) = response.get("usage") {
-                    if let Some(it) = usage.get("input_tokens").and_then(|p| p.as_u64()) {
-                        state.input_tokens = it;
-                    }
                     if let Some(ot) = usage.get("output_tokens").and_then(|c| c.as_u64()) {
                         state.output_tokens = ot;
                     }
-                    if let Some(cached) = usage.get("input_tokens_details").and_then(|d| d.get("cached_tokens")).and_then(|c| c.as_u64()) {
+                    if let Some(it) = usage.get("input_tokens").and_then(|p| p.as_u64()) {
+                        state.input_tokens = it;
+                    }
+                    if let Some(cached) = usage.pointer("/input_tokens_details/cached_tokens").and_then(|c| c.as_u64()) {
                         state.cache_read_tokens = cached;
                         state.cache_creation_tokens = if cached > 0 { 0 } else { state.input_tokens };
                     }
                 }
+                if let Some(sr) = response.get("stop_reason").and_then(|s| s.as_str()) {
+                    state.stop_reason = finish_reason_map(sr).to_string();
+                }
             }
         }
+
         _ => {}
     }
 
@@ -562,10 +520,41 @@ pub fn stream_responses_end(state: &ResponsesStreamState) -> Vec<String> {
             "index": state.text_block_index,
         })));
     }
+    // Emit tool block stops in index order, deduplicating since we store both item_id and call_id
+    let mut seen_blocks = std::collections::HashSet::new();
+    let mut tool_stops: Vec<usize> = state.tool_block_map.values()
+        .filter(|&&idx| seen_blocks.insert(idx))
+        .copied()
+        .collect();
+    tool_stops.sort_unstable();
+    for block_idx in tool_stops {
+        // Emit buffered arguments after stripping empty-string values (e.g. GPT generates pages: "")
+        if let Some(args) = state.tool_block_args.get(&block_idx) {
+            let cleaned = strip_empty_string_values(args);
+            if !cleaned.is_empty() {
+                events.push(sse("content_block_delta", &json!({
+                    "type": "content_block_delta",
+                    "index": block_idx,
+                    "delta": {"type": "input_json_delta", "partial_json": cleaned},
+                })));
+            }
+        }
+        events.push(sse("content_block_stop", &json!({
+            "type": "content_block_stop",
+            "index": block_idx,
+        })));
+    }
+
+    // Infer stop_reason: if any tool blocks were opened during streaming → tool_use
+    let final_stop_reason = if !seen_blocks.is_empty() {
+        "tool_use".to_string()
+    } else {
+        state.stop_reason.clone()
+    };
 
     events.push(sse("message_delta", &json!({
         "type": "message_delta",
-        "delta": {"stop_reason": &state.stop_reason, "stop_sequence": null},
+        "delta": {"stop_reason": final_stop_reason, "stop_sequence": null},
         "usage": {
             "output_tokens": state.output_tokens,
             "input_tokens": state.input_tokens,

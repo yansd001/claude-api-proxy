@@ -15,6 +15,7 @@ use axum::{
 use config::{Config, Provider, load_config, new_provider_id, save_config};
 use converters::gemini_conv;
 use converters::openai_conv;
+use converters::openai_responses_conv;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -32,7 +33,34 @@ async fn log_request(req: Request, next: middleware::Next) -> Response {
     println!("--> {} {}", method, uri);
     let response = next.run(req).await;
     let elapsed = start.elapsed();
-    println!("<-- {} {} {} ({:.1}ms)", method, uri, response.status().as_u16(), elapsed.as_secs_f64() * 1000.0);
+    let status = response.status();
+    let status_code = status.as_u16();
+    println!("<-- {} {} {} ({:.1}ms)", method, uri, status_code, elapsed.as_secs_f64() * 1000.0);
+
+    // For error responses, read and log the body (skip streaming responses)
+    if status.is_client_error() || status.is_server_error() {
+        let is_stream = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("text/event-stream"))
+            .unwrap_or(false);
+
+        if !is_stream {
+            let (parts, body) = response.into_parts();
+            match axum::body::to_bytes(body, 1024 * 1024).await {
+                Ok(bytes) => {
+                    let body_str = String::from_utf8_lossy(&bytes);
+                    eprintln!("    ERROR body: {}", body_str.chars().take(2048).collect::<String>());
+                    return Response::from_parts(parts, Body::from(bytes));
+                }
+                Err(_) => {
+                    return Response::from_parts(parts, Body::empty());
+                }
+            }
+        }
+    }
+
     response
 }
 
@@ -188,6 +216,7 @@ async fn messages_handler(req: Request) -> Response {
 
     match provider_type.as_str() {
         "openai" => handle_openai(&provider, &body, &target_model, claude_model, &message_id, is_stream).await,
+        "openai_responses" => handle_openai_responses(&provider, &body, &target_model, claude_model, &message_id, is_stream).await,
         "gemini" => handle_gemini(&provider, &body, &target_model, claude_model, &message_id, is_stream).await,
         _ => (StatusCode::BAD_REQUEST, JsonResponse(json!({"detail": format!("Unknown provider type: {}", provider_type)}))).into_response(),
     }
@@ -286,6 +315,125 @@ async fn handle_openai(provider: &Provider, body: &Value, target_model: &str, cl
     }
     let openai_resp: Value = serde_json::from_str(&body_text).unwrap_or(json!({}));
     JsonResponse(openai_conv::convert_openai_response(&openai_resp, claude_model, message_id)).into_response()
+}
+
+async fn handle_openai_responses(provider: &Provider, body: &Value, target_model: &str, claude_model: &str, message_id: &str, is_stream: bool) -> Response {
+    let mut base_url = provider.base_url.trim_end_matches('/').to_string();
+    if !base_url.ends_with("/v1") {
+        base_url = format!("{}/v1", base_url);
+    }
+    let url = format!("{}/responses", base_url);
+    let responses_req = openai_responses_conv::build_responses_request(body, target_model);
+
+    // Debug: log the input array structure (types only, not content) to diagnose tool call issues
+    if let Some(input) = responses_req.get("input").and_then(|i| i.as_array()) {
+        let summary: Vec<String> = input.iter().map(|item| {
+            let role = item.get("role").and_then(|r| r.as_str());
+            let itype = item.get("type").and_then(|t| t.as_str());
+            match (itype, role) {
+                (Some(t), _) => t.to_string(),
+                (_, Some(r)) => r.to_string(),
+                _ => "?".to_string(),
+            }
+        }).collect();
+        println!("    [responses] input[{}]: [{}]", input.len(), summary.join(", "));
+    }
+
+    let headers = make_auth_headers(provider);
+    let client = reqwest::Client::new();
+
+    if is_stream {
+        let claude_model = claude_model.to_string();
+        let message_id = message_id.to_string();
+
+        let resp = match client.post(&url).headers(headers).json(&responses_req).timeout(std::time::Duration::from_secs(600)).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return (StatusCode::BAD_GATEWAY, JsonResponse(json!({"detail": e.to_string()}))).into_response();
+            }
+        };
+
+        if resp.status().is_client_error() || resp.status().is_server_error() {
+            let status_code = resp.status().as_u16();
+            let err_body = resp.text().await.unwrap_or_default();
+            eprintln!("    [responses] upstream error {}: {}", status_code, &err_body.chars().take(2048).collect::<String>());
+            let event = format!("data: {}\n\n", err_body);
+            return Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from(event))
+                .unwrap();
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
+
+        tokio::spawn(async move {
+            for event in openai_responses_conv::stream_responses_start(&claude_model, &message_id) {
+                if tx.send(Ok(event)).await.is_err() { return; }
+            }
+
+            let mut state = openai_responses_conv::ResponsesStreamState::default();
+            let mut stream = resp.bytes_stream();
+            let mut buffer = String::new();
+            let mut pending_event_type: Option<String> = None;
+
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(bytes) => {
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        while let Some(pos) = buffer.find('\n') {
+                            let line = buffer[..pos].trim().to_string();
+                            buffer = buffer[pos + 1..].to_string();
+
+                            if line.starts_with("event:") {
+                                pending_event_type = Some(line[6..].trim().to_string());
+                            } else if line.starts_with("data:") {
+                                let raw = line[5..].trim();
+                                if raw == "[DONE]" {
+                                    pending_event_type = None;
+                                    continue;
+                                }
+                                if let (Some(ev_type), Ok(data)) = (&pending_event_type, serde_json::from_str::<serde_json::Value>(raw)) {
+                                    for event in openai_responses_conv::process_responses_stream_event(ev_type, &data, &mut state) {
+                                        if tx.send(Ok(event)).await.is_err() { return; }
+                                    }
+                                }
+                                pending_event_type = None;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            for event in openai_responses_conv::stream_responses_end(&state) {
+                let _ = tx.send(Ok(event)).await;
+            }
+        });
+
+        let stream = ReceiverStream::new(rx);
+        let body = Body::from_stream(stream);
+        return Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(body)
+            .unwrap();
+    }
+
+    // Non-streaming
+    let resp = match client.post(&url).headers(headers).json(&responses_req).timeout(std::time::Duration::from_secs(600)).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, JsonResponse(json!({"detail": e.to_string()}))).into_response();
+        }
+    };
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if status.is_client_error() || status.is_server_error() {
+        let val: Value = serde_json::from_str(&body_text).unwrap_or(json!({"detail": body_text}));
+        return (StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), JsonResponse(val)).into_response();
+    }
+    let responses_resp: Value = serde_json::from_str(&body_text).unwrap_or(json!({}));
+    JsonResponse(openai_responses_conv::convert_responses_response(&responses_resp, claude_model, message_id)).into_response()
 }
 
 async fn handle_gemini(provider: &Provider, body: &Value, target_model: &str, claude_model: &str, message_id: &str, is_stream: bool) -> Response {
