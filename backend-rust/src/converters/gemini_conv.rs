@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use super::openai_conv::{strip_empty_values, strip_empty_values_str};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -118,11 +119,14 @@ pub fn build_gemini_request(anthropic_body: &Value, target_model: &str) -> (Stri
     let mut contents: Vec<Value> = Vec::new();
 
     if let Some(msgs) = messages {
+        // Clone the full message list once here so get_tool_name can look up IDs
+        // across the entire history when resolving tool_result → functionResponse.
+        // Previously this clone happened inside the loop (O(N²)); now it is O(N).
+        let msgs_arr: Vec<Value> = msgs.to_vec();
         for msg in msgs {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
             let gemini_role = if role == "assistant" { "model" } else { "user" };
             let content = msg.get("content").unwrap_or(&json!(null));
-            let msgs_arr: Vec<Value> = messages.map(|m| m.to_vec()).unwrap_or_default();
             let parts = content_to_gemini_parts(content, &msgs_arr);
             if !parts.is_empty() {
                 contents.push(json!({"role": gemini_role, "parts": parts}));
@@ -173,6 +177,26 @@ pub fn build_gemini_request(anthropic_body: &Value, target_model: &str) -> (Stri
             })
             .collect();
         body["tools"] = json!([{"function_declarations": fn_decls}]);
+
+        // Map Anthropic tool_choice → Gemini tool_config.function_calling_config
+        if let Some(tc) = anthropic_body.get("tool_choice") {
+            let tc_type = tc.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let tool_config = match tc_type {
+                "auto" => json!({"function_calling_config": {"mode": "AUTO"}}),
+                "any"  => json!({"function_calling_config": {"mode": "ANY"}}),
+                "tool" => {
+                    let name = tc.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    json!({
+                        "function_calling_config": {
+                            "mode": "ANY",
+                            "allowed_function_names": [name],
+                        }
+                    })
+                }
+                _ => json!({"function_calling_config": {"mode": "AUTO"}}),
+            };
+            body["tool_config"] = tool_config;
+        }
     }
 
     (target_model.to_string(), body)
@@ -208,11 +232,12 @@ pub fn convert_gemini_response(gemini_resp: &Value, claude_model: &str, message_
                         content_blocks.push(json!({"type": "text", "text": text}));
                     } else if let Some(fc) = part.get("functionCall") {
                         let tool_id = format!("toolu_{}", &uuid::Uuid::new_v4().as_simple().to_string()[..16]);
+                        let raw_args = fc.get("args").cloned().unwrap_or(json!({}));
                         content_blocks.push(json!({
                             "type": "tool_use",
                             "id": tool_id,
                             "name": fc.get("name").and_then(|n| n.as_str()).unwrap_or(""),
-                            "input": fc.get("args").unwrap_or(&json!({})),
+                            "input": strip_empty_values(raw_args),
                         }));
                     }
                 }
@@ -242,7 +267,8 @@ pub fn convert_gemini_response(gemini_resp: &Value, claude_model: &str, message_
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cache_read_input_tokens": cached_tokens,
-            "cache_creation_input_tokens": if cached_tokens > 0 { 0 } else { input_tokens },
+            // Gemini KV cache has no "creation" charge; only track reads
+            "cache_creation_input_tokens": 0,
         }
     })
 }
@@ -370,7 +396,11 @@ pub fn process_gemini_stream_line(line: &str, state: &mut GeminiStreamState) -> 
                 let block_idx = state.next_index;
                 state.next_index += 1;
                 let tool_id = format!("toolu_{}", &uuid::Uuid::new_v4().as_simple().to_string()[..16]);
-                let args_str = serde_json::to_string(fc.get("args").unwrap_or(&json!({}))).unwrap_or_default();
+                let raw_args = fc.get("args").cloned().unwrap_or(json!({}));
+                // Strip empty optional params (e.g. pages: [], offset: "") before forwarding
+                let args_str = strip_empty_values_str(
+                    &serde_json::to_string(&raw_args).unwrap_or_default()
+                );
 
                 events.push(sse("content_block_start", &json!({
                     "type": "content_block_start",
@@ -416,7 +446,8 @@ pub fn stream_gemini_end(state: &GeminiStreamState) -> Vec<String> {
             "output_tokens": state.output_tokens,
             "input_tokens": state.input_tokens,
             "cache_read_input_tokens": state.cache_read_tokens,
-            "cache_creation_input_tokens": if state.cache_read_tokens > 0 { 0 } else { state.input_tokens },
+            // Gemini KV cache has no "creation" charge; only track reads
+            "cache_creation_input_tokens": 0,
         },
     })));
     events.push(sse("message_stop", &json!({"type": "message_stop"})));

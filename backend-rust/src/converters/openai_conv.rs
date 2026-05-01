@@ -283,7 +283,9 @@ pub fn convert_openai_response(openai_resp: &Value, claude_model: &str, message_
             let func = &tc["function"];
             let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let args_str = func.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
-            let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+            let raw_input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+            // Strip null / empty-string / empty-array optional params before forwarding
+            let input = strip_empty_values(raw_input);
             content_blocks.push(json!({
                 "type": "tool_use",
                 "id": id,
@@ -306,9 +308,8 @@ pub fn convert_openai_response(openai_resp: &Value, claude_model: &str, message_
         .and_then(|c| c.as_u64())
         .unwrap_or(0);
 
-    // Map to Anthropic format: cached portion → cache_read, remainder → input
+    // Map to Anthropic format: cached portion → cache_read; no cache_creation concept in OpenAI
     let cache_read = cached_tokens;
-    let cache_creation = if cached_tokens > 0 { 0 } else { input_tokens };
 
     json!({
         "id": message_id,
@@ -322,7 +323,8 @@ pub fn convert_openai_response(openai_resp: &Value, claude_model: &str, message_
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cache_read_input_tokens": cache_read,
-            "cache_creation_input_tokens": cache_creation,
+            // OpenAI KV cache has no explicit "creation" charge; always 0
+            "cache_creation_input_tokens": 0,
         }
     })
 }
@@ -358,6 +360,9 @@ pub struct OpenAIStreamState {
     pub next_index: usize,
     pub text_block_index: i32,
     pub tool_block_map: HashMap<usize, usize>,
+    /// Buffered raw argument JSON fragments per block index.
+    /// Emitted (after cleaning) at stream end instead of streaming raw deltas.
+    pub tool_block_args: HashMap<usize, String>,
     pub stop_reason: String,
     pub output_tokens: u64,
     pub input_tokens: u64,
@@ -371,12 +376,43 @@ impl Default for OpenAIStreamState {
             next_index: 0,
             text_block_index: -1,
             tool_block_map: HashMap::new(),
+            tool_block_args: HashMap::new(),
             stop_reason: "end_turn".to_string(),
             output_tokens: 0,
             input_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
         }
+    }
+}
+
+/// Recursively strip null, empty-string, and empty-array fields from a JSON value.
+/// Prevents LLM-generated empty optional params (e.g. `pages: ""`, `pages: []`)
+/// from reaching the client and failing schema validation.
+pub(crate) fn strip_empty_values(val: Value) -> Value {
+    match val {
+        Value::Object(map) => {
+            let cleaned: serde_json::Map<String, Value> = map
+                .into_iter()
+                .filter_map(|(k, v)| match &v {
+                    Value::Null => None,
+                    Value::String(s) if s.is_empty() => None,
+                    Value::Array(a) if a.is_empty() => None,
+                    _ => Some((k, strip_empty_values(v))),
+                })
+                .collect();
+            Value::Object(cleaned)
+        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(strip_empty_values).collect()),
+        other => other,
+    }
+}
+
+/// Parse a JSON string, strip empty values, and re-serialize.
+pub(crate) fn strip_empty_values_str(json_str: &str) -> String {
+    match serde_json::from_str::<Value>(json_str) {
+        Ok(val) => serde_json::to_string(&strip_empty_values(val)).unwrap_or_else(|_| json_str.to_string()),
+        Err(_) => json_str.to_string(),
     }
 }
 
@@ -406,9 +442,9 @@ pub fn process_openai_stream_line(line: &str, state: &mut OpenAIStreamState) -> 
         // Extract cached tokens from OpenAI's prompt_tokens_details
         if let Some(cached) = usage.pointer("/prompt_tokens_details/cached_tokens").and_then(|c| c.as_u64()) {
             state.cache_read_tokens = cached;
-            // If we have cached tokens, no creation; otherwise all input is "created"
-            state.cache_creation_tokens = if cached > 0 { 0 } else { state.input_tokens };
         }
+        // OpenAI KV cache has no explicit cache-creation charge; always 0
+        state.cache_creation_tokens = 0;
     }
 
     let choices = match chunk.get("choices").and_then(|c| c.as_array()) {
@@ -480,11 +516,8 @@ pub fn process_openai_stream_line(line: &str, state: &mut OpenAIStreamState) -> 
             if let Some(args) = tc_delta.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()) {
                 if !args.is_empty() {
                     let block_idx = state.tool_block_map.get(&tc_idx).copied().unwrap_or(state.next_index.saturating_sub(1));
-                    events.push(sse("content_block_delta", &json!({
-                        "type": "content_block_delta",
-                        "index": block_idx,
-                        "delta": {"type": "input_json_delta", "partial_json": args},
-                    })));
+                    // Buffer instead of emitting immediately; will be cleaned and emitted in stream_openai_end
+                    state.tool_block_args.entry(block_idx).or_insert_with(String::new).push_str(args);
                 }
             }
         }
@@ -506,16 +539,42 @@ pub fn stream_openai_end(state: &OpenAIStreamState) -> Vec<String> {
             "index": state.text_block_index,
         })));
     }
-    for block_idx in state.tool_block_map.values() {
+
+    // Emit tool blocks in index order, deduplicating
+    let mut seen_blocks = std::collections::HashSet::new();
+    let mut tool_stops: Vec<usize> = state.tool_block_map.values()
+        .filter(|&&idx| seen_blocks.insert(idx))
+        .copied()
+        .collect();
+    tool_stops.sort_unstable();
+    for block_idx in tool_stops {
+        // Emit buffered arguments after stripping empty null/string/array values
+        if let Some(args) = state.tool_block_args.get(&block_idx) {
+            let cleaned = strip_empty_values_str(args);
+            if !cleaned.is_empty() && cleaned != "{}" {
+                events.push(sse("content_block_delta", &json!({
+                    "type": "content_block_delta",
+                    "index": block_idx,
+                    "delta": {"type": "input_json_delta", "partial_json": cleaned},
+                })));
+            }
+        }
         events.push(sse("content_block_stop", &json!({
             "type": "content_block_stop",
             "index": block_idx,
         })));
     }
 
+    // Infer stop_reason: if any tool blocks were opened → tool_use
+    let final_stop_reason = if !seen_blocks.is_empty() {
+        "tool_use".to_string()
+    } else {
+        state.stop_reason.clone()
+    };
+
     events.push(sse("message_delta", &json!({
         "type": "message_delta",
-        "delta": {"stop_reason": &state.stop_reason, "stop_sequence": null},
+        "delta": {"stop_reason": final_stop_reason, "stop_sequence": null},
         "usage": {
             "output_tokens": state.output_tokens,
             "input_tokens": state.input_tokens,

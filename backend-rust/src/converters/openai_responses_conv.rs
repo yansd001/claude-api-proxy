@@ -218,8 +218,11 @@ pub fn build_responses_request(anthropic_body: &Value, target_model: &str) -> Va
                 "auto" => { req["tool_choice"] = json!("auto"); }
                 "any" => { req["tool_choice"] = json!("required"); }
                 "tool" => {
+                    // Responses API format differs from Chat Completions:
+                    // Responses: {"type": "function", "name": "fn_name"}
+                    // Chat Completions: {"type": "function", "function": {"name": "fn_name"}}
                     let name = tc.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    req["tool_choice"] = json!({"type": "function", "function": {"name": name}});
+                    req["tool_choice"] = json!({"type": "function", "name": name});
                 }
                 _ => {}
             }
@@ -269,7 +272,9 @@ pub fn convert_responses_response(resp: &Value, claude_model: &str, message_id: 
                     let id = item.get("call_id").and_then(|i| i.as_str()).unwrap_or("");
                     let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
                     let args_str = item.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
-                    let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                    let raw_input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                    // Strip null / empty-string / empty-array optional params before forwarding
+                    let input = strip_empty_values(raw_input);
                     content_blocks.push(json!({
                         "type": "tool_use",
                         "id": id,
@@ -302,7 +307,6 @@ pub fn convert_responses_response(resp: &Value, claude_model: &str, message_id: 
         .unwrap_or(0);
 
     let cache_read = cached_tokens;
-    let cache_creation = if cached_tokens > 0 { 0 } else { input_tokens };
 
     json!({
         "id": message_id,
@@ -316,7 +320,8 @@ pub fn convert_responses_response(resp: &Value, claude_model: &str, message_id: 
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cache_read_input_tokens": cache_read,
-            "cache_creation_input_tokens": cache_creation,
+            // Responses API KV cache has no explicit "creation" charge; always 0
+            "cache_creation_input_tokens": 0,
         }
     })
 }
@@ -378,17 +383,37 @@ impl Default for ResponsesStreamState {
     }
 }
 
-/// Stub kept for API symmetry; actual parsing uses process_responses_stream_event.
-/// Remove keys whose value is an empty string from a JSON object string.
-/// This prevents GPT-generated empty optional params (e.g. pages:"") from
-/// reaching the client and failing validation.
+/// Recursively strip null, empty-string, and empty-array fields from a JSON value.
+/// This prevents LLM-generated empty optional params (e.g. `pages: ""`, `pages: []`)
+/// from reaching the client and failing schema validation.
+fn strip_empty_values(val: Value) -> Value {
+    match val {
+        Value::Object(map) => {
+            let cleaned: serde_json::Map<String, Value> = map
+                .into_iter()
+                .filter_map(|(k, v)| match &v {
+                    Value::Null => None,
+                    Value::String(s) if s.is_empty() => None,
+                    Value::Array(a) if a.is_empty() => None,
+                    _ => Some((k, strip_empty_values(v))),
+                })
+                .collect();
+            Value::Object(cleaned)
+        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(strip_empty_values).collect()),
+        other => other,
+    }
+}
+
+#[allow(dead_code)]
 fn strip_empty_string_values(json_str: &str) -> String {
-    if let Ok(serde_json::Value::Object(mut map)) = serde_json::from_str::<serde_json::Value>(json_str) {
-        map.retain(|_, v| v != &serde_json::Value::String(String::new()));
-        serde_json::to_string(&serde_json::Value::Object(map))
-            .unwrap_or_else(|_| json_str.to_string())
-    } else {
-        json_str.to_string()
+    strip_empty_values_str(json_str)
+}
+
+fn strip_empty_values_str(json_str: &str) -> String {
+    match serde_json::from_str::<Value>(json_str) {
+        Ok(val) => serde_json::to_string(&strip_empty_values(val)).unwrap_or_else(|_| json_str.to_string()),
+        Err(_) => json_str.to_string(),
     }
 }
 
@@ -496,8 +521,9 @@ pub fn process_responses_stream_event(
                     }
                     if let Some(cached) = usage.pointer("/input_tokens_details/cached_tokens").and_then(|c| c.as_u64()) {
                         state.cache_read_tokens = cached;
-                        state.cache_creation_tokens = if cached > 0 { 0 } else { state.input_tokens };
                     }
+                    // Responses API KV cache has no explicit cache-creation charge; always 0
+                    state.cache_creation_tokens = 0;
                 }
                 if let Some(sr) = response.get("stop_reason").and_then(|s| s.as_str()) {
                     state.stop_reason = finish_reason_map(sr).to_string();
@@ -528,9 +554,9 @@ pub fn stream_responses_end(state: &ResponsesStreamState) -> Vec<String> {
         .collect();
     tool_stops.sort_unstable();
     for block_idx in tool_stops {
-        // Emit buffered arguments after stripping empty-string values (e.g. GPT generates pages: "")
+        // Emit buffered arguments after stripping empty null/string/array values
         if let Some(args) = state.tool_block_args.get(&block_idx) {
-            let cleaned = strip_empty_string_values(args);
+            let cleaned = strip_empty_values_str(args);
             if !cleaned.is_empty() {
                 events.push(sse("content_block_delta", &json!({
                     "type": "content_block_delta",
