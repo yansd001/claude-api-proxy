@@ -105,6 +105,43 @@ fn make_auth_headers(provider: &Provider) -> reqwest::header::HeaderMap {
 }
 
 // ---------------------------------------------------------------------------
+// Error conversion: upstream (OpenAI/Gemini) → Anthropic format
+// ---------------------------------------------------------------------------
+// Claude Code expects {"type":"error","error":{"type":"...","message":"..."}}
+// for all error responses.  Upstream APIs use different shapes, so we normalise
+// them here before returning to the client.
+
+fn upstream_error_to_anthropic(status_code: u16, body: &str) -> Value {
+    let parsed: Value = serde_json::from_str(body).unwrap_or(json!({}));
+
+    // Both OpenAI and Gemini nest the human-readable message under error.message
+    let message = parsed
+        .pointer("/error/message")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| body.chars().take(500).collect::<String>());
+
+    let error_type = match status_code {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        429 => "rate_limit_error",
+        529 => "overloaded_error",
+        500..=599 => "api_error",
+        _ => "api_error",
+    };
+
+    json!({
+        "type": "error",
+        "error": {
+            "type": error_type,
+            "message": message,
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Anthropic direct forwarding
 // ---------------------------------------------------------------------------
 
@@ -244,12 +281,10 @@ async fn handle_openai(provider: &Provider, body: &Value, target_model: &str, cl
         };
 
         if resp.status().is_client_error() || resp.status().is_server_error() {
+            let status_code = resp.status().as_u16();
             let err_body = resp.text().await.unwrap_or_default();
-            let event = format!("data: {}\n\n", err_body);
-            return Response::builder()
-                .header("content-type", "text/event-stream")
-                .body(Body::from(event))
-                .unwrap();
+            let err = upstream_error_to_anthropic(status_code, &err_body);
+            return (StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), JsonResponse(err)).into_response();
         }
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
@@ -310,8 +345,8 @@ async fn handle_openai(provider: &Provider, body: &Value, target_model: &str, cl
     let status = resp.status();
     let body_text = resp.text().await.unwrap_or_default();
     if status.is_client_error() || status.is_server_error() {
-        let val: Value = serde_json::from_str(&body_text).unwrap_or(json!({"detail": body_text}));
-        return (StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), JsonResponse(val)).into_response();
+        let err = upstream_error_to_anthropic(status.as_u16(), &body_text);
+        return (StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), JsonResponse(err)).into_response();
     }
     let openai_resp: Value = serde_json::from_str(&body_text).unwrap_or(json!({}));
     JsonResponse(openai_conv::convert_openai_response(&openai_resp, claude_model, message_id)).into_response()
@@ -327,7 +362,8 @@ async fn handle_openai_responses(provider: &Provider, body: &Value, target_model
 
     // Debug: log the input array structure (types only, not content) to diagnose tool call issues
     if let Some(input) = responses_req.get("input").and_then(|i| i.as_array()) {
-        let summary: Vec<String> = input.iter().map(|item| {
+        let n = input.len();
+        let summary: Vec<String> = input.iter().take(20).map(|item| {
             let role = item.get("role").and_then(|r| r.as_str());
             let itype = item.get("type").and_then(|t| t.as_str());
             match (itype, role) {
@@ -336,7 +372,11 @@ async fn handle_openai_responses(provider: &Provider, body: &Value, target_model
                 _ => "?".to_string(),
             }
         }).collect();
-        println!("    [responses] input[{}]: [{}]", input.len(), summary.join(", "));
+        if n > 20 {
+            println!("    [responses] input[{}]: [{}, ...]", n, summary.join(", "));
+        } else {
+            println!("    [responses] input[{}]: [{}]", n, summary.join(", "));
+        }
     }
 
     let headers = make_auth_headers(provider);
@@ -356,12 +396,9 @@ async fn handle_openai_responses(provider: &Provider, body: &Value, target_model
         if resp.status().is_client_error() || resp.status().is_server_error() {
             let status_code = resp.status().as_u16();
             let err_body = resp.text().await.unwrap_or_default();
-            eprintln!("    [responses] upstream error {}: {}", status_code, &err_body.chars().take(2048).collect::<String>());
-            let event = format!("data: {}\n\n", err_body);
-            return Response::builder()
-                .header("content-type", "text/event-stream")
-                .body(Body::from(event))
-                .unwrap();
+            eprintln!("    [responses] upstream error {}: {}", status_code, &err_body.chars().take(500).collect::<String>());
+            let err = upstream_error_to_anthropic(status_code, &err_body);
+            return (StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), JsonResponse(err)).into_response();
         }
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
@@ -429,8 +466,8 @@ async fn handle_openai_responses(provider: &Provider, body: &Value, target_model
     let status = resp.status();
     let body_text = resp.text().await.unwrap_or_default();
     if status.is_client_error() || status.is_server_error() {
-        let val: Value = serde_json::from_str(&body_text).unwrap_or(json!({"detail": body_text}));
-        return (StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), JsonResponse(val)).into_response();
+        let err = upstream_error_to_anthropic(status.as_u16(), &body_text);
+        return (StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), JsonResponse(err)).into_response();
     }
     let responses_resp: Value = serde_json::from_str(&body_text).unwrap_or(json!({}));
     JsonResponse(openai_responses_conv::convert_responses_response(&responses_resp, claude_model, message_id)).into_response()
@@ -466,12 +503,10 @@ async fn handle_gemini(provider: &Provider, body: &Value, target_model: &str, cl
         };
 
         if resp.status().is_client_error() || resp.status().is_server_error() {
+            let status_code = resp.status().as_u16();
             let err_body = resp.text().await.unwrap_or_default();
-            let event = format!("data: {}\n\n", err_body);
-            return Response::builder()
-                .header("content-type", "text/event-stream")
-                .body(Body::from(event))
-                .unwrap();
+            let err = upstream_error_to_anthropic(status_code, &err_body);
+            return (StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), JsonResponse(err)).into_response();
         }
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(100);
@@ -534,8 +569,8 @@ async fn handle_gemini(provider: &Provider, body: &Value, target_model: &str, cl
     let status = resp.status();
     let body_text = resp.text().await.unwrap_or_default();
     if status.is_client_error() || status.is_server_error() {
-        let val: Value = serde_json::from_str(&body_text).unwrap_or(json!({"detail": body_text}));
-        return (StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), JsonResponse(val)).into_response();
+        let err = upstream_error_to_anthropic(status.as_u16(), &body_text);
+        return (StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), JsonResponse(err)).into_response();
     }
     let gemini_resp: Value = serde_json::from_str(&body_text).unwrap_or(json!({}));
     JsonResponse(gemini_conv::convert_gemini_response(&gemini_resp, claude_model, message_id)).into_response()
