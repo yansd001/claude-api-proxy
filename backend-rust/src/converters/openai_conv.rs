@@ -100,10 +100,20 @@ fn anthropic_messages_to_openai(messages: &[Value], system: Option<&Value>) -> V
                     })
                     .collect();
 
+                // Collect images embedded inside tool_result content blocks.
+                // OpenAI tool messages only support text; images must be surfaced
+                // as a separate user message (e.g. BashTool image output).
+                let mut tr_image_blocks: Vec<Value> = Vec::new();
+
                 for tr in &tool_results {
                     let default_content = json!("");
                     let tr_content = tr.get("content").unwrap_or(&default_content);
                     let content_str = if let Some(arr) = tr_content.as_array() {
+                        for b in arr {
+                            if b.get("type").and_then(|t| t.as_str()) == Some("image") {
+                                tr_image_blocks.push(b.clone());
+                            }
+                        }
                         arr.iter()
                             .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
                             .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
@@ -123,9 +133,13 @@ fn anthropic_messages_to_openai(messages: &[Value], system: Option<&Value>) -> V
                     }));
                 }
 
-                if !other.is_empty() {
-                    let other_owned: Vec<Value> = other.into_iter().cloned().collect();
-                    let converted = user_content_blocks_to_openai(&other_owned);
+                // Combine top-level non-tool-result blocks with any images
+                // extracted from tool_result content.
+                let mut combined_other: Vec<Value> = other.into_iter().cloned().collect();
+                combined_other.extend(tr_image_blocks);
+
+                if !combined_other.is_empty() {
+                    let converted = user_content_blocks_to_openai(&combined_other);
                     result.push(json!({"role": "user", "content": converted}));
                 }
             } else if role == "assistant" {
@@ -240,6 +254,7 @@ pub fn build_openai_request(anthropic_body: &Value, target_model: &str) -> Value
             match tc_type {
                 "auto" => { req["tool_choice"] = json!("auto"); }
                 "any" => { req["tool_choice"] = json!("required"); }
+                "none" => { req["tool_choice"] = json!("none"); }
                 "tool" => {
                     let name = tc.get("name").and_then(|n| n.as_str()).unwrap_or("");
                     req["tool_choice"] = json!({"type": "function", "function": {"name": name}});
@@ -306,9 +321,9 @@ pub fn convert_openai_response(openai_resp: &Value, claude_model: &str, message_
         .and_then(|c| c.as_u64())
         .unwrap_or(0);
 
-    // Map to Anthropic format: cached portion → cache_read, remainder → input
+    // OpenAI reports cache reads but never cache creation; always 0.
     let cache_read = cached_tokens;
-    let cache_creation = if cached_tokens > 0 { 0 } else { input_tokens };
+    let cache_creation = 0u64;
 
     json!({
         "id": message_id,
@@ -403,11 +418,10 @@ pub fn process_openai_stream_line(line: &str, state: &mut OpenAIStreamState) -> 
         if let Some(pt) = usage.get("prompt_tokens").and_then(|p| p.as_u64()) {
             state.input_tokens = pt;
         }
-        // Extract cached tokens from OpenAI's prompt_tokens_details
+        // Extract cached tokens from OpenAI's prompt_tokens_details.
+        // OpenAI never reports cache creation, so cache_creation_tokens stays 0.
         if let Some(cached) = usage.pointer("/prompt_tokens_details/cached_tokens").and_then(|c| c.as_u64()) {
             state.cache_read_tokens = cached;
-            // If we have cached tokens, no creation; otherwise all input is "created"
-            state.cache_creation_tokens = if cached > 0 { 0 } else { state.input_tokens };
         }
     }
 
@@ -506,7 +520,10 @@ pub fn stream_openai_end(state: &OpenAIStreamState) -> Vec<String> {
             "index": state.text_block_index,
         })));
     }
-    for block_idx in state.tool_block_map.values() {
+    // Emit stops in ascending block-index order (HashMap iteration is non-deterministic).
+    let mut block_indices: Vec<usize> = state.tool_block_map.values().copied().collect();
+    block_indices.sort_unstable();
+    for block_idx in block_indices {
         events.push(sse("content_block_stop", &json!({
             "type": "content_block_stop",
             "index": block_idx,

@@ -103,10 +103,20 @@ fn anthropic_messages_to_responses_input(messages: &[Value], system: Option<&Val
                     })
                     .collect();
 
+                // Collect images embedded inside tool_result content blocks.
+                // OpenAI Responses API function_call_output only supports text;
+                // images must be surfaced as a separate user message.
+                let mut tr_image_blocks: Vec<Value> = Vec::new();
+
                 for tr in &tool_results {
                     let default_content = json!("");
                     let tr_content = tr.get("content").unwrap_or(&default_content);
                     let content_str = if let Some(arr) = tr_content.as_array() {
+                        for b in arr {
+                            if b.get("type").and_then(|t| t.as_str()) == Some("image") {
+                                tr_image_blocks.push(b.clone());
+                            }
+                        }
                         arr.iter()
                             .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
                             .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
@@ -126,9 +136,13 @@ fn anthropic_messages_to_responses_input(messages: &[Value], system: Option<&Val
                     }));
                 }
 
-                if !other.is_empty() {
-                    let other_owned: Vec<Value> = other.into_iter().cloned().collect();
-                    let converted = user_content_blocks_to_responses(&other_owned);
+                // Combine top-level non-tool-result blocks with any images
+                // extracted from tool_result content.
+                let mut combined_other: Vec<Value> = other.into_iter().cloned().collect();
+                combined_other.extend(tr_image_blocks);
+
+                if !combined_other.is_empty() {
+                    let converted = user_content_blocks_to_responses(&combined_other);
                     result.push(json!({"role": "user", "content": converted}));
                 }
             } else if role == "assistant" {
@@ -217,6 +231,7 @@ pub fn build_responses_request(anthropic_body: &Value, target_model: &str) -> Va
             match tc_type {
                 "auto" => { req["tool_choice"] = json!("auto"); }
                 "any" => { req["tool_choice"] = json!("required"); }
+                "none" => { req["tool_choice"] = json!("none"); }
                 "tool" => {
                     let name = tc.get("name").and_then(|n| n.as_str()).unwrap_or("");
                     req["tool_choice"] = json!({"type": "function", "function": {"name": name}});
@@ -301,8 +316,8 @@ pub fn convert_responses_response(resp: &Value, claude_model: &str, message_id: 
         .and_then(|c| c.as_u64())
         .unwrap_or(0);
 
+    // Responses API reports cache reads but never cache creation; always 0.
     let cache_read = cached_tokens;
-    let cache_creation = if cached_tokens > 0 { 0 } else { input_tokens };
 
     json!({
         "id": message_id,
@@ -316,7 +331,7 @@ pub fn convert_responses_response(resp: &Value, claude_model: &str, message_id: 
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cache_read_input_tokens": cache_read,
-            "cache_creation_input_tokens": cache_creation,
+            "cache_creation_input_tokens": 0,
         }
     })
 }
@@ -495,8 +510,8 @@ pub fn process_responses_stream_event(
                         state.input_tokens = it;
                     }
                     if let Some(cached) = usage.pointer("/input_tokens_details/cached_tokens").and_then(|c| c.as_u64()) {
+                        // Responses API never reports cache creation; cache_creation_tokens stays 0.
                         state.cache_read_tokens = cached;
-                        state.cache_creation_tokens = if cached > 0 { 0 } else { state.input_tokens };
                     }
                 }
                 if let Some(sr) = response.get("stop_reason").and_then(|s| s.as_str()) {

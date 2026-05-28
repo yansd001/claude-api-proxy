@@ -4,6 +4,41 @@ use serde_json::{json, Value};
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Strip JSON Schema fields that Gemini's function-declaration validator rejects.
+/// Gemini accepts an OpenAPI 3.0 subset: it rejects `$schema`, and
+/// `additionalProperties` (produced by Zod's `z.strictObject` / `toJSONSchema`).
+fn sanitize_schema_for_gemini(schema: &Value) -> Value {
+    match schema {
+        Value::Object(obj) => {
+            let mut cleaned = serde_json::Map::new();
+            for (k, v) in obj {
+                match k.as_str() {
+                    "$schema" | "additionalProperties" => {}
+                    "properties" => {
+                        if let Some(props) = v.as_object() {
+                            let sanitized_props: serde_json::Map<String, Value> = props
+                                .iter()
+                                .map(|(pk, pv)| (pk.clone(), sanitize_schema_for_gemini(pv)))
+                                .collect();
+                            cleaned.insert(k.clone(), Value::Object(sanitized_props));
+                        } else {
+                            cleaned.insert(k.clone(), v.clone());
+                        }
+                    }
+                    "items" => {
+                        cleaned.insert(k.clone(), sanitize_schema_for_gemini(v));
+                    }
+                    _ => {
+                        cleaned.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            Value::Object(cleaned)
+        }
+        _ => schema.clone(),
+    }
+}
+
 fn get_tool_name(messages: &[Value], tool_use_id: &str) -> String {
     for msg in messages {
         if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
@@ -86,16 +121,37 @@ fn content_to_gemini_parts(content: &Value, all_messages: &[Value]) -> Vec<Value
             "tool_result" => {
                 let default_content = json!("");
                 let tr_content = block.get("content").unwrap_or(&default_content);
-                let content_str = if let Some(arr) = tr_content.as_array() {
-                    arr.iter()
+                let (content_str, img_parts): (String, Vec<Value>) = if let Some(arr) = tr_content.as_array() {
+                    let text = arr.iter()
                         .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
                         .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
                         .collect::<Vec<_>>()
-                        .join("\n")
+                        .join("\n");
+                    // Collect inline images from the tool result content
+                    let imgs: Vec<Value> = arr.iter()
+                        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("image"))
+                        .filter_map(|b| {
+                            let source = b.get("source")?;
+                            let src_type = source.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                            if src_type == "base64" {
+                                let mime = source.get("media_type").and_then(|t| t.as_str()).unwrap_or("");
+                                let data = source.get("data").and_then(|t| t.as_str()).unwrap_or("");
+                                Some(json!({
+                                    "inline_data": {
+                                        "mime_type": mime,
+                                        "data": data,
+                                    }
+                                }))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    (text, imgs)
                 } else if let Some(s) = tr_content.as_str() {
-                    s.to_string()
+                    (s.to_string(), Vec::new())
                 } else {
-                    String::new()
+                    (String::new(), Vec::new())
                 };
 
                 let tool_use_id = block.get("tool_use_id").and_then(|t| t.as_str()).unwrap_or("");
@@ -106,6 +162,8 @@ fn content_to_gemini_parts(content: &Value, all_messages: &[Value]) -> Vec<Value
                         "response": {"result": content_str},
                     }
                 }));
+                // Append any images as inline_data parts (Gemini supports mixed parts)
+                parts.extend(img_parts);
             }
             _ => {}
         }
@@ -167,12 +225,28 @@ pub fn build_gemini_request(anthropic_body: &Value, target_model: &str) -> (Stri
                     "description": t.get("description").and_then(|d| d.as_str()).unwrap_or(""),
                 });
                 if let Some(schema) = t.get("input_schema") {
-                    decl["parameters"] = schema.clone();
+                    decl["parameters"] = sanitize_schema_for_gemini(schema);
                 }
                 decl
             })
             .collect();
         body["tools"] = json!([{"function_declarations": fn_decls}]);
+
+        // Map Anthropic tool_choice to Gemini toolConfig.functionCallingConfig
+        if let Some(tc) = anthropic_body.get("tool_choice") {
+            let tc_type = tc.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let fn_calling_config = match tc_type {
+                "auto" => json!({"mode": "AUTO"}),
+                "any"  => json!({"mode": "ANY"}),
+                "none" => json!({"mode": "NONE"}),
+                "tool" => {
+                    let name = tc.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    json!({"mode": "ANY", "allowedFunctionNames": [name]})
+                }
+                _ => json!({"mode": "AUTO"}),
+            };
+            body["toolConfig"] = json!({"functionCallingConfig": fn_calling_config});
+        }
     }
 
     (target_model.to_string(), body)
@@ -230,6 +304,7 @@ pub fn convert_gemini_response(gemini_resp: &Value, claude_model: &str, message_
     let output_tokens = usage_meta.get("candidatesTokenCount").and_then(|c| c.as_u64()).unwrap_or(0);
     let cached_tokens = usage_meta.get("cachedContentTokenCount").and_then(|c| c.as_u64()).unwrap_or(0);
 
+    // Gemini reports cached content reads but never cache creation; always 0.
     json!({
         "id": message_id,
         "type": "message",
@@ -242,7 +317,7 @@ pub fn convert_gemini_response(gemini_resp: &Value, claude_model: &str, message_
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "cache_read_input_tokens": cached_tokens,
-            "cache_creation_input_tokens": if cached_tokens > 0 { 0 } else { input_tokens },
+            "cache_creation_input_tokens": 0,
         }
     })
 }
@@ -416,7 +491,7 @@ pub fn stream_gemini_end(state: &GeminiStreamState) -> Vec<String> {
             "output_tokens": state.output_tokens,
             "input_tokens": state.input_tokens,
             "cache_read_input_tokens": state.cache_read_tokens,
-            "cache_creation_input_tokens": if state.cache_read_tokens > 0 { 0 } else { state.input_tokens },
+            "cache_creation_input_tokens": 0,
         },
     })));
     events.push(sse("message_stop", &json!({"type": "message_stop"})));
